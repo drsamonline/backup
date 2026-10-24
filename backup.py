@@ -139,6 +139,56 @@ def delete_folder(owner, dumps, path, token):
 
 
 # --------------------------------------------------------------------------- #
+# --check: prove the token can do BOTH halves, before trusting it
+# --------------------------------------------------------------------------- #
+def check(src_owner, src_repo, dump_owner, dumps, token):
+    """Read the source repo, write a probe into the dumps repo, delete it again.
+
+    Also reports whether the token can CREATE a repo - needed only for the
+    rollover when a dumps repo fills up. A missing repo is not a failure here;
+    it is reported, because the token then needs `administration: write`.
+    """
+    good = True
+
+    r = call("GET", f"/repos/{src_owner}/{src_repo}", token)
+    if isinstance(r, dict) and r.get("_error"):
+        print("  FAIL  cannot READ %s/%s  (%s)" % (src_owner, src_repo, r.get("_error"))); good = False
+    else:
+        print("  ok    can READ the source repo %s/%s" % (src_owner, src_repo))
+
+    info = call("GET", f"/repos/{dump_owner}/{dumps}", token)
+    if isinstance(info, dict) and info.get("_error"):
+        print("  FAIL  cannot see the dumps repo %s/%s  (%s)" % (dump_owner, dumps, info.get("_error"))); good = False
+        return 1
+
+    probe = "_token_check.txt"
+    put = call("PUT", f"/repos/{dump_owner}/{dumps}/contents/{probe}", token,
+               {"message": "backup: token check", "content": base64.b64encode(b"ok").decode()})
+    if isinstance(put, dict) and put.get("_error"):
+        print("  FAIL  cannot WRITE the dumps repo  (%s)" % put.get("_error")); good = False
+    else:
+        print("  ok    can WRITE the dumps repo %s/%s" % (dump_owner, dumps))
+        sha = (put.get("content") or {}).get("sha")
+        if sha:
+            call("DELETE", f"/repos/{dump_owner}/{dumps}/contents/{probe}", token,
+                 {"message": "backup: token check cleanup", "sha": sha})
+            print("  ok    cleaned up the probe")
+
+    made = call("POST", "/user/repos", token, {"name": "_backup-token-check-delete-me",
+                                               "private": True, "auto_init": True,
+                                               "description": "temporary: backup token check"})
+    if isinstance(made, dict) and made.get("_error"):
+        print("  note  cannot CREATE a repo (%s) - fine UNLESS a dumps repo fills up and must roll over;"
+              % made.get("_error"))
+        print("        either add `administration: write` to the token, or create the next dumps repo by hand.")
+    else:
+        print("  ok    can CREATE a repo (rollover will work)")
+        call("DELETE", "/repos/%s/%s" % (dump_owner, "_backup-token-check-delete-me"), token)
+        print("  ok    cleaned up the test repo")
+    return 0 if good else 1
+
+
+# --------------------------------------------------------------------------- #
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Snapshot a repo before it changes.")
     ap.add_argument("--repo", required=True, help="owner/name of the SOURCE repo")
@@ -151,6 +201,8 @@ def main(argv=None):
     ap.add_argument("--public", action="store_true",
                     help="create new dumps repos PUBLIC (default: private, because they hold source code)")
     ap.add_argument("--token", default="", help="a token (default: $GITHUB_TOKEN / $GH_TOKEN)")
+    ap.add_argument("--check", action="store_true",
+                    help="do not back up: verify the token can read the source and write the dumps repo")
     a = ap.parse_args(argv)
 
     import os
@@ -163,6 +215,10 @@ def main(argv=None):
     src_owner, src_repo = a.repo.split("/", 1)
     dump_owner = a.owner or src_owner
     ref = a.ref or call("GET", f"/repos/{src_owner}/{src_repo}", token).get("default_branch", "main")
+
+    if a.check:
+        print(f"token check: {a.repo}  ->  {dump_owner}/{a.dumps}")
+        return check(src_owner, src_repo, dump_owner, a.dumps, token)
 
     print(f"backup: {a.repo} @ {ref}  ->  {dump_owner}/{a.dumps}")
     blob = tarball(src_owner, src_repo, ref, token)
