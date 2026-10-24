@@ -141,6 +141,53 @@ def delete_folder(owner, dumps, path, token):
 # --------------------------------------------------------------------------- #
 # --check: prove the token can do BOTH halves, before trusting it
 # --------------------------------------------------------------------------- #
+# --all: dump every repository, from ONE workflow in ONE repository
+# --------------------------------------------------------------------------- #
+SKIP = {"dumps", "backup", "drsamonline", "drsamonline.github.io"}
+
+def all_repos(owner, token):
+    """Every repo the token can see: the owner's own (private included) if it can,
+    otherwise the public ones. Tooling repos are skipped."""
+    out, page = [], 1
+    while True:
+        batch = call("GET", f"/user/repos?per_page=100&page={page}&affiliation=owner", token)
+        if isinstance(batch, dict) and batch.get("_error"):
+            batch = call("GET", f"/users/{owner}/repos?per_page=100&page={page}&sort=pushed", token)
+        if not isinstance(batch, list) or not batch:
+            break
+        out += batch
+        if len(batch) < 100:
+            break
+        page += 1
+    names = sorted(r["name"] for r in out
+                   if r.get("owner", {}).get("login", owner) == owner
+                   and r["name"] not in SKIP and not r.get("fork") and not r.get("archived"))
+    return names
+
+
+def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=print):
+    """Fetch one repo's tarball and write it into the dumps repo. Returns True/False."""
+    blob = tarball(src_owner, src_repo, ref, token)
+    if isinstance(blob, dict):
+        log(f"  {src_repo}: could not fetch ({blob.get('_error')}) - skipped")
+        return False
+    folder = folder_for(src_owner, src_repo)
+    when = stamp()
+    path = f"{folder}/{when}/{src_repo}.tar.gz"
+    put = call("PUT", f"/repos/{dump_owner}/{dumps}/contents/{path}", token, {
+        "message": f"backup: {src_owner}/{src_repo} ({when})",
+        "content": base64.b64encode(blob).decode()})
+    if isinstance(put, dict) and put.get("_error"):
+        log(f"  {src_repo}: could not write ({put.get('_error')})")
+        return False
+    have = list_dump_folders(dump_owner, dumps, folder, token)
+    for old in dumps_to_delete(have, keep):
+        delete_folder(dump_owner, dumps, f"{folder}/{old}", token)
+    log(f"  {src_repo}: {len(blob)/1e6:.2f} MB -> {dumps}/{path}  (kept {min(len(have), keep)})")
+    return True
+
+
+# --------------------------------------------------------------------------- #
 def check(src_owner, src_repo, dump_owner, dumps, token):
     """Read the source repo, write a probe into the dumps repo, delete it again.
 
@@ -191,7 +238,7 @@ def check(src_owner, src_repo, dump_owner, dumps, token):
 # --------------------------------------------------------------------------- #
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Snapshot a repo before it changes.")
-    ap.add_argument("--repo", required=True, help="owner/name of the SOURCE repo")
+    ap.add_argument("--repo", default="", help="owner/name of the SOURCE repo (not needed with --all)")
     ap.add_argument("--ref", default="", help="the ref about to be replaced (default: the default branch)")
     ap.add_argument("--dumps", default="dumps", help="the dumps repo name (default: dumps)")
     ap.add_argument("--owner", default="", help="the dumps repo owner (default: the source owner)")
@@ -201,6 +248,8 @@ def main(argv=None):
     ap.add_argument("--public", action="store_true",
                     help="create new dumps repos PUBLIC (default: private, because they hold source code)")
     ap.add_argument("--token", default="", help="a token (default: $GITHUB_TOKEN / $GH_TOKEN)")
+    ap.add_argument("--all", action="store_true",
+                    help="dump EVERY repo the token can see (one workflow, one secret, in one repo)")
     ap.add_argument("--check", action="store_true",
                     help="do not back up: verify the token can read the source and write the dumps repo")
     a = ap.parse_args(argv)
@@ -210,8 +259,22 @@ def main(argv=None):
     if not token:
         raise SystemExit("no token: set GITHUB_TOKEN (contents:write on the dumps repo, contents:read on the source)")
 
+    if a.all:
+        owner = a.owner or (a.repo.split("/")[0] if "/" in a.repo else "drsamonline")
+        print(f"backup --all: every repo of {owner}  ->  {owner}/{a.dumps}")
+        dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)
+        names = all_repos(owner, token)
+        print(f"  {len(names)} repos")
+        done = 0
+        for name in names:
+            if dump_one(owner, name, owner, dumps, token, a.keep):
+                done += 1
+            dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)  # roll over mid-run
+        print(f"  backed up {done} of {len(names)}")
+        return 0 if done else 1
+
     if "/" not in a.repo:
-        raise SystemExit("--repo must be owner/name")
+        raise SystemExit("--repo must be owner/name (or use --all)")
     src_owner, src_repo = a.repo.split("/", 1)
     dump_owner = a.owner or src_owner
     ref = a.ref or call("GET", f"/repos/{src_owner}/{src_repo}", token).get("default_branch", "main")
