@@ -1,6 +1,6 @@
 # Creating `BACKUP_TOKEN`
 
-The backup workflow needs **one secret** per repository: `BACKUP_TOKEN`. It is a
+The backup needs **ONE secret, in ONE repository**: `drsamonline/dumps`. It is a
 **fine-grained personal access token** — the narrow kind, limited to the repositories you
 pick and to one permission.
 
@@ -70,12 +70,11 @@ gh secret set BACKUP_TOKEN --repo drsamonline/forge
 # it prompts; paste the token
 ```
 
-Repeat per repository (or loop over them):
+And that is all — one repo:
 
 ```bash
-for r in forge ml-kit case-kit bmi-bmr-tdee-macros-fluid-calculator; do
-  gh secret set BACKUP_TOKEN --repo drsamonline/$r
-done
+gh secret set BACKUP_TOKEN --repo drsamonline/dumps
+# it prompts; paste the token. That is the only repo that needs it.
 ```
 
 ## 3. Verify it — do not assume
@@ -104,3 +103,25 @@ create the next dumps repo by hand when the time comes.
 Set a reminder for the expiry date. When it passes, the workflow stops being able to write
 and the backup job will **skip with a warning** (it will not fail your PRs, and it will not
 pretend the backup ran). Create a new token, `gh secret set BACKUP_TOKEN` again, done.
+
+---
+
+## Optional: a true pre-merge snapshot in one repo
+
+The scheduled backup is the safe default: **one secret, one place, every repo covered**. If
+you want a repository snapshotted at the exact moment before a merge — rather than up to six
+hours earlier — that repository calls the reusable workflow, and **that repository** needs
+its own copy of the secret:
+
+```yaml
+name: backup
+on: [pull_request]
+jobs:
+  backup:
+    uses: drsamonline/backup/.github/workflows/backup.yml@main
+    secrets: { BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }} }
+```
+
+Do this for **the repos where it matters**, not all of them. Every repo you add is another
+copy of a write-capable token to leak and to rotate — which is the whole reason the default
+lives in one place.

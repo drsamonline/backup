@@ -59,8 +59,6 @@ jobs:
       BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
 ```
 
-**Creating the token: see [`TOKEN.md`](TOKEN.md)** — it has the exact permission, a pre-filled link, and a `--check` you can run to verify it.
-
 One secret, **`BACKUP_TOKEN`**, is required: a token with `contents: write` on the dumps
 repositories and `contents: read` on the source repository. (`GITHUB_TOKEN` is scoped to a
 single repository, so it cannot write to the dumps repo.)
@@ -90,15 +88,6 @@ source repository is already public.
 | `--keep` | `100` | backups kept per repository; the oldest beyond it are deleted |
 | `--max-bytes` | `800 MB` | the dumps repo size cap before rolling to a new repo |
 | `--public` | off | create new dumps repos public (read the warning above) |
-
-## Check your token
-
-```bash
-GITHUB_TOKEN=... python3 backup.py --check --repo drsamonline/forge
-```
-
-It reads the source, writes a probe into the dumps repo, deletes it again, and says whether
-the rollover would work. See [`TOKEN.md`](TOKEN.md).
 
 ## Verified
 
