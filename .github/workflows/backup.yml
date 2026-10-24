@@ -1,0 +1,63 @@
+name: backup
+
+# A REUSABLE workflow: snapshot a repository's code BEFORE a merge replaces it.
+# Call it from any repo's own workflow (see README). It writes a compressed copy
+# into a dumps repo, keeps the newest `keep` per repository, and rolls over to a
+# new dumps repo (`dumps-2`, `dumps-3`, ...) when the current one is full.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "The ref to snapshot. Leave empty to use the PR's BASE commit (the pre-merge state)."
+        type: string
+        required: false
+        default: ""
+      dumps_repo:
+        description: "The dumps repo name."
+        type: string
+        required: false
+        default: "dumps"
+      dumps_owner:
+        description: "The dumps repo owner. Default: the source repo's owner."
+        type: string
+        required: false
+        default: ""
+      keep:
+        description: "How many backups to keep per repository."
+        type: number
+        required: false
+        default: 100
+      max_mb:
+        description: "The dumps repo size cap in MB before rolling to a new repo."
+        type: number
+        required: false
+        default: 800
+    secrets:
+      BACKUP_TOKEN:
+        description: "A token with contents:write on the dumps repo and contents:read on the source."
+        required: true
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: drsamonline/backup
+          path: .backup
+      - name: Snapshot the pre-merge state
+        env:
+          GITHUB_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+          IN_REF: ${{ inputs.ref }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          REF="${IN_REF:-${BASE:-${{ github.sha }}}}"
+          echo "backing up ${{ github.repository }} @ $REF"
+          python3 .backup/backup.py \
+            --repo "${{ github.repository }}" \
+            --ref "$REF" \
+            --dumps "${{ inputs.dumps_repo }}" \
+            ${{ inputs.dumps_owner != '' && format('--owner {0}', inputs.dumps_owner) || '' }} \
+            --keep ${{ inputs.keep }} \
+            --max-bytes $(( ${{ inputs.max_mb }} * 1024 * 1024 ))
