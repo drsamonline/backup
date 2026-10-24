@@ -46,7 +46,19 @@ jobs:
         with:
           repository: drsamonline/backup
           path: .backup
+      - name: Is the backup token set?
+        id: tok
+        env:
+          T: ${{ secrets.BACKUP_TOKEN }}
+        run: |
+          if [ -z "$T" ]; then
+            echo "::warning title=backup skipped::BACKUP_TOKEN is not set on this repository, so the pre-merge backup did NOT run. Add it to enable backups."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
       - name: Snapshot the pre-merge state
+        if: steps.tok.outputs.skip != '1'
         env:
           GITHUB_TOKEN: ${{ secrets.BACKUP_TOKEN }}
           IN_REF: ${{ inputs.ref }}
