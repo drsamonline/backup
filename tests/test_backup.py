@@ -42,7 +42,8 @@ ok("the folder names the owner and the repo", B.folder_for("drsamonline", "ml-ki
 # ---- the dumps repo rollover: the size limit creates a NEW repo ----
 class Fake:
     """A stub GitHub: repos that exist, with sizes, plus a record of creations."""
-    def __init__(self, sizes): self.sizes = sizes; self.created = []; self.calls = []
+    def __init__(self, sizes):
+        self.sizes = sizes; self.created = []; self.calls = []; self.payloads = []
     def __call__(self, method, path, token, data=None, raw=False, timeout=180):
         self.calls.append((method, path))
         if method == "GET" and path.startswith("/repos/"):
@@ -50,7 +51,8 @@ class Fake:
             if name in self.sizes: return {"size": self.sizes[name] // 1024}
             return {"_error": 404}
         if method == "POST" and path == "/user/repos":
-            self.created.append(data["name"]); self.sizes[data["name"]] = 0
+            self.created.append(data["name"]); self.payloads.append(dict(data))
+            self.sizes[data["name"]] = 0
             return {"name": data["name"]}
         return {}
 
@@ -65,12 +67,43 @@ f2 = Fake({"dumps": 900 * 1024 * 1024})     # over the 800 MB cap
 B.call = f2
 ok("a full dumps repo rolls over to a NEW one", B.pick_dumps_repo("o", "dumps", "t", 800*1024*1024, log=lambda *_: None) == "dumps-2")
 ok("...and the new repo was actually created", f2.created == ["dumps-2"])
-ok("...and it is created PRIVATE by default (it holds source code)", True)
+ok("...and it is created PRIVATE by default (it holds source code)",
+   f2.payloads and f2.payloads[0].get("private") is True)
 
 f3 = Fake({})                                 # nothing exists yet
 B.call = f3
 ok("a missing dumps repo is created on first use", B.pick_dumps_repo("o", "dumps", "t", 800*1024*1024, log=lambda *_: None) == "dumps" and f3.created == ["dumps"])
 B.call = orig
+
+# ---- a partial backup is not a successful one (F-42) ----
+# `backup.py --all` returned `0 if done else 1`, so 78 of 83 backed up exited 0 and
+# the five that were missing were a log line inside a green run. This asserts the
+# run now fails, and names what it could not take.
+import io, contextlib
+
+def _run_all(failing):
+    """Run main() with --all against a fake GitHub. `failing` = names that cannot be dumped."""
+    orig = (B.all_repos, B.dump_one, B.pick_dumps_repo, sys.argv)
+    B.all_repos = lambda owner, token: ["a", "b", "c"]
+    B.pick_dumps_repo = lambda *a, **k: "dumps"
+    B.dump_one = lambda so, sr, do, du, tok, keep, ref="", log=print: sr not in failing
+    sys.argv = ["backup.py", "--all", "--repo", "drsamonline/x", "--token", "fake"]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = B.main()
+    finally:
+        B.all_repos, B.dump_one, B.pick_dumps_repo, sys.argv = orig
+    return rc, buf.getvalue()
+
+rc, out = _run_all({"b"})
+ok("one repo unbacked -> the run FAILS", rc == 1)
+ok("...and names the repo it could not take", "NOT BACKED UP (1): b" in out)
+ok("...and still reports the count it did take", "backed up 2 of 3" in out)
+
+rc, out = _run_all(set())
+ok("everything backed up -> the run passes", rc == 0)
+ok("...and reports the full count", "backed up 3 of 3" in out)
 
 print(f"\n{pass_} passed, {fail} failed")
 sys.exit(1 if fail else 0)

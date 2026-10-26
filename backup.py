@@ -265,13 +265,23 @@ def main(argv=None):
         dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)
         names = all_repos(owner, token)
         print(f"  {len(names)} repos")
-        done = 0
+        done, failed = 0, []
         for name in names:
             if dump_one(owner, name, owner, dumps, token, a.keep):
                 done += 1
+            else:
+                failed.append(name)
             dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)  # roll over mid-run
         print(f"  backed up {done} of {len(names)}")
-        return 0 if done else 1
+        if failed:
+            # A PARTIAL BACKUP IS NOT A SUCCESSFUL ONE. This returned `0 if done else 1`,
+            # so 78 of 83 backed up exited 0 and the five that were missing were a log
+            # line inside a green run - which is how The_Browser went unbacked for the
+            # life of the corpus without anyone noticing. The run now fails, and names
+            # what it could not take.
+            print(f"  NOT BACKED UP ({len(failed)}): {', '.join(failed)}")
+            return 1
+        return 0
 
     if "/" not in a.repo:
         raise SystemExit("--repo must be owner/name (or use --all)")
