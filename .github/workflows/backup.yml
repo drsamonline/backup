@@ -50,7 +50,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # SUFFIXED, and it has to be. In a called workflow the github context reflects the
+  # CALLER, so `github.workflow` here is the caller's name. forge's caller is also
+  # called "backup" and also uses `${{ github.workflow }}-${{ github.ref }}`, so both
+  # resolved to the same group - and GitHub refuses to schedule a called workflow
+  # whose concurrency group collides with its caller's. The run then fails with zero
+  # jobs, no log, no check run and no annotation, which is indistinguishable from an
+  # invalid workflow file. That is what forge/backup.yml has been doing 40 times.
+  group: ${{ github.workflow }}-${{ github.ref }}-snapshot
   cancel-in-progress: false
 
 jobs:
