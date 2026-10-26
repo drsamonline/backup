@@ -37,7 +37,14 @@ on:
     secrets:
       BACKUP_TOKEN:
         description: "A token with contents:write on the dumps repo and contents:read on the source."
-        required: true
+        # NOT required, deliberately. When this was `true`, a caller that did not
+        # hold the secret was rejected at workflow-validation time - before any job
+        # was created - so the "is the token set?" guard below could never run, and
+        # the failure left no log, no check run and no annotation. That is exactly
+        # what happened to forge/backup.yml: 40 runs, 40 startup failures, and no
+        # way to see why. Optional means a missing token reaches the guard, which
+        # warns and skips, which is what this workflow was always designed to do.
+        required: false
 
 permissions:
   contents: read
