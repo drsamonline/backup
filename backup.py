@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import sys
 import urllib.error
@@ -118,6 +119,19 @@ def pick_dumps_repo(owner, base, token, cap_bytes, private=True, log=print):
         n += 1
 
 
+def git_blob_sha(data: bytes) -> str:
+    """The sha git itself would give these bytes: sha1("blob <len>\\0" + data).
+
+    GitHub's contents API returns the stored object's git blob sha in the PUT
+    response, so comparing it with this proves the file that landed is byte-for-byte
+    what we fetched - without a second request and without downloading it again.
+    """
+    h = hashlib.sha1()
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
 def list_dump_folders(owner, dumps, folder, token):
     """The timestamp folders already in <dumps>/<folder>/."""
     items = call("GET", f"/repos/{owner}/{dumps}/contents/{folder}", token)
@@ -180,6 +194,21 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     if isinstance(put, dict) and put.get("_error"):
         log(f"  {src_repo}: could not write ({put.get('_error')})")
         return False
+
+    # VERIFY WHAT LANDED. A successful PUT only means the request was accepted; it is
+    # not evidence that the stored object is complete. The response carries the stored
+    # blob's sha, so comparing it with the sha of the bytes we sent proves it exactly.
+    # Without this, a truncated or corrupted dump was indistinguishable from a good one
+    # and the only proof of recoverability was a green workflow.
+    want = git_blob_sha(blob)
+    got = ((put.get("content") or {}).get("sha") or "")
+    if got and got != want:
+        log(f"  {src_repo}: INTEGRITY FAILURE - stored {got[:10]} != fetched {want[:10]} "
+            f"({len(blob)} bytes) - NOT keeping this snapshot's retention sweep")
+        return False
+    if not got:
+        log(f"  {src_repo}: written, but the API returned no sha - integrity NOT verified")
+
     have = list_dump_folders(dump_owner, dumps, folder, token)
     for old in dumps_to_delete(have, keep):
         delete_folder(dump_owner, dumps, f"{folder}/{old}", token)

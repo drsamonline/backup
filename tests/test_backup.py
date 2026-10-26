@@ -105,5 +105,28 @@ rc, out = _run_all(set())
 ok("everything backed up -> the run passes", rc == 0)
 ok("...and reports the full count", "backed up 3 of 3" in out)
 
+# ---- a dump that lands corrupt must not count as backed up (F-43) ----
+# A successful PUT only means the request was accepted. The response carries the stored
+# blob's sha, so it can be compared with the sha of the bytes we sent.
+import hashlib as _h
+_data = b"the repository tarball"
+ok("the blob sha is git's own algorithm",
+   B.git_blob_sha(_data) == _h.sha1(b"blob %d\0" % len(_data) + _data).hexdigest())
+
+def _dump_with(put_sha):
+    """Run dump_one against a fake API whose PUT reports `put_sha`."""
+    orig = (B.tarball, B.call, B.list_dump_folders)
+    B.tarball = lambda o, r, ref, t: _data
+    B.call = lambda method, path, token, data=None, raw=False, timeout=180: {"content": {"sha": put_sha}}
+    B.list_dump_folders = lambda *a, **k: []
+    try:
+        return B.dump_one("o", "r", "o", "dumps", "t", 100, log=lambda *_: None)
+    finally:
+        B.tarball, B.call, B.list_dump_folders = orig
+
+ok("a dump whose stored sha matches is accepted", _dump_with(B.git_blob_sha(_data)) is True)
+ok("a dump whose stored sha does NOT match is REJECTED", _dump_with("0" * 40) is False)
+ok("a dump with no sha reported is accepted, and says it is unverified", _dump_with("") is True)
+
 print(f"\n{pass_} passed, {fail} failed")
 sys.exit(1 if fail else 0)
