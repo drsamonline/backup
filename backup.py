@@ -89,6 +89,94 @@ def folder_for(owner, repo):
     return f"{owner}__{repo}"
 
 
+MANIFEST = "manifest.json"
+
+
+def manifest_from(entries, generated_at=""):
+    """The dumps index, DERIVED from the dumps repo's own tree.
+
+    `entries` are the tree's nodes (dicts with `path`, `size`, `type`). A dump is a
+    path of exactly three parts - <owner>__<repo>/<stamp>/<repo>.tar.gz - so anything
+    else in the repo (README, LICENSE, .github, a file loose in a repository folder)
+    is not a dump and is not indexed.
+
+    This exists because the manifest was hand-written once and never again: it went on
+    claiming one repository was backed up while the store held 78. A derived index
+    cannot drift, and if it is wrong the tree it was derived from is wrong too.
+    """
+    dumps, total = {}, 0
+    for e in entries:
+        if e.get("type") not in (None, "blob"):
+            continue
+        parts = (e.get("path") or "").split("/")
+        if len(parts) != 3:
+            continue
+        folder, when, name = parts
+        if not name.endswith(".tar.gz") or "T" not in when or not when.endswith("Z"):
+            continue
+        size = int(e.get("size") or 0)
+        dumps.setdefault(folder, []).append(
+            {"at": when, "file": e["path"], "bytes": size,
+             "source": folder.replace("__", "/", 1)})
+        total += size
+    for snaps in dumps.values():
+        snaps.sort(key=lambda d: d["at"])
+    return {
+        "written_by": "drsamonline/backup",
+        "generated_at": generated_at,
+        "note": ("Derived from the dumps repository's own tree, so it cannot go stale. One folder "
+                 "per repository, one folder per snapshot named with the date and time, and the "
+                 "repository inside it as a .tar.gz. The commit each dump holds is inside the "
+                 "tarball: read it with --restore-test."),
+        "repositories": len(dumps),
+        "snapshots": sum(len(v) for v in dumps.values()),
+        "bytes": total,
+        "dumps": {k: dumps[k] for k in sorted(dumps)},
+    }
+
+
+def write_manifest(dump_owner, dumps, token, log=print):
+    """Regenerate <dumps>/manifest.json from the tree, and prove it landed.
+
+    Returns 0/1. A failure here FAILS the run on purpose: a derived index that is
+    allowed to go stale quietly is exactly the defect this replaces.
+    """
+    info = call("GET", f"/repos/{dump_owner}/{dumps}", token)
+    if isinstance(info, dict) and info.get("_error"):
+        log(f"  manifest: cannot read {dump_owner}/{dumps} ({info.get('_error')})")
+        return 1
+    branch = info.get("default_branch") or "main"
+    r = call("GET", f"/repos/{dump_owner}/{dumps}/git/trees/{branch}?recursive=1", token)
+    if isinstance(r, dict) and r.get("_error"):
+        log(f"  manifest: cannot read the tree of {dump_owner}/{dumps} ({r.get('_error')})")
+        return 1
+    if r.get("truncated"):
+        log(f"  manifest: GitHub truncated the tree of {dump_owner}/{dumps}; "
+            f"an incomplete index is not written")
+        return 1
+
+    doc = manifest_from(r.get("tree") or [], stamp())
+    body = (json.dumps(doc, indent=1) + "\n").encode()
+    payload = {"message": f"manifest: {doc['repositories']} repositories, "
+                          f"{doc['snapshots']} snapshots ({doc['generated_at']})",
+               "content": base64.b64encode(body).decode()}
+    cur = call("GET", f"/repos/{dump_owner}/{dumps}/contents/{MANIFEST}", token)
+    if isinstance(cur, dict) and not cur.get("_error") and cur.get("sha"):
+        payload["sha"] = cur["sha"]
+    put = call("PUT", f"/repos/{dump_owner}/{dumps}/contents/{MANIFEST}", token, payload)
+    if isinstance(put, dict) and put.get("_error"):
+        log(f"  manifest: could not write ({put.get('_error')})")
+        return 1
+    got = ((put.get("content") or {}).get("sha") or "")
+    want = git_blob_sha(body)
+    if got and got != want:
+        log(f"  manifest: INTEGRITY FAILURE - stored {got[:10]} != written {want[:10]}")
+        return 1
+    log(f"  manifest: {doc['repositories']} repositories, {doc['snapshots']} snapshots, "
+        f"{doc['bytes']/1e6:.1f} MB")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # The dumps repo: pick one under the cap, creating the next if it is full
 # --------------------------------------------------------------------------- #
@@ -412,6 +500,8 @@ def main(argv=None):
                     help="dump EVERY repo the token can see (one workflow, one secret, in one repo)")
     ap.add_argument("--check", action="store_true",
                     help="do not back up: verify the token can read the source and write the dumps repo")
+    ap.add_argument("--manifest", action="store_true",
+                    help="do not back up: regenerate the dumps repo's manifest.json from its tree")
     ap.add_argument("--restore-test", action="store_true",
                     help="do not back up: unpack one dump and compare it, file by file, with the commit it holds")
     ap.add_argument("--at", default="",
@@ -437,6 +527,7 @@ def main(argv=None):
                 failed.append(name)
             dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)  # roll over mid-run
         print(f"  backed up {done} of {len(names)}")
+        manifest_rc = write_manifest(owner, dumps, token)
         if failed:
             # A PARTIAL BACKUP IS NOT A SUCCESSFUL ONE. This returned `0 if done else 1`,
             # so 78 of 83 backed up exited 0 and the five that were missing were a log
@@ -445,7 +536,7 @@ def main(argv=None):
             # what it could not take.
             print(f"  NOT BACKED UP ({len(failed)}): {', '.join(failed)}")
             return 1
-        return 0
+        return manifest_rc
 
     if "/" not in a.repo:
         raise SystemExit("--repo must be owner/name (or use --all)")
@@ -459,6 +550,10 @@ def main(argv=None):
 
     if a.restore_test:
         return restore_test(src_owner, src_repo, dump_owner, a.dumps, a.at, token)
+
+    if a.manifest:
+        print(f"manifest: {dump_owner}/{a.dumps}")
+        return write_manifest(dump_owner, a.dumps, token)
 
     print(f"backup: {a.repo} @ {ref}  ->  {dump_owner}/{a.dumps}")
     blob = tarball(src_owner, src_repo, ref, token)
@@ -485,7 +580,7 @@ def main(argv=None):
         delete_folder(dump_owner, dumps, f"{folder}/{old}", token)
         print(f"  rotated out {old}")
     print(f"  kept {min(len(have), a.keep)} of {len(have)} (limit {a.keep})")
-    return 0
+    return write_manifest(dump_owner, dumps, token)
 
 
 if __name__ == "__main__":

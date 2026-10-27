@@ -83,17 +83,20 @@ import io, contextlib
 
 def _run_all(failing):
     """Run main() with --all against a fake GitHub. `failing` = names that cannot be dumped."""
-    orig = (B.all_repos, B.dump_one, B.pick_dumps_repo, sys.argv)
+    orig = (B.all_repos, B.dump_one, B.pick_dumps_repo, B.write_manifest, sys.argv)
     B.all_repos = lambda owner, token: ["a", "b", "c"]
     B.pick_dumps_repo = lambda *a, **k: "dumps"
     B.dump_one = lambda so, sr, do, du, tok, keep, ref="", log=print: sr not in failing
+    # The manifest is written after the loop and its result is the run's result (F-98),
+    # so the loop tests stub it; the manifest's own behaviour is tested separately below.
+    B.write_manifest = lambda *a, **k: 0
     sys.argv = ["backup.py", "--all", "--repo", "drsamonline/x", "--token", "fake"]
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
             rc = B.main()
     finally:
-        B.all_repos, B.dump_one, B.pick_dumps_repo, sys.argv = orig
+        B.all_repos, B.dump_one, B.pick_dumps_repo, B.write_manifest, sys.argv = orig
     return rc, buf.getvalue()
 
 rc, out = _run_all({"b"})
@@ -104,6 +107,22 @@ ok("...and still reports the count it did take", "backed up 2 of 3" in out)
 rc, out = _run_all(set())
 ok("everything backed up -> the run passes", rc == 0)
 ok("...and reports the full count", "backed up 3 of 3" in out)
+
+def _run_all_bad_manifest():
+    orig = (B.all_repos, B.dump_one, B.pick_dumps_repo, B.write_manifest, sys.argv)
+    B.all_repos = lambda owner, token: ["a"]
+    B.pick_dumps_repo = lambda *a, **k: "dumps"
+    B.dump_one = lambda *a, **k: True
+    B.write_manifest = lambda *a, **k: 1
+    sys.argv = ["backup.py", "--all", "--repo", "drsamonline/x", "--token", "fake"]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            return B.main()
+    finally:
+        B.all_repos, B.dump_one, B.pick_dumps_repo, B.write_manifest, sys.argv = orig
+
+ok("a manifest that could not be written FAILS an otherwise good run", _run_all_bad_manifest() == 1)
 
 # ---- a dump that lands corrupt must not count as backed up (F-43) ----
 # A successful PUT only means the request was accepted. The response carries the stored
@@ -180,6 +199,70 @@ ok("an extra file is reported", B.compare_trees({"a": "1", "b": "2"}, {"a": "1"}
 ok("an altered file is reported", B.compare_trees({"a": "9"}, {"a": "1"})[2] == ["a"])
 ok("a restore is not exact if anything differs",
    B.compare_trees({"a": "9", "b": "2", "c": "3"}, {"a": "1", "b": "2", "d": "4"}) != ([], [], []))
+
+# ---- the dumps manifest is DERIVED, so it cannot go stale (F-98) ----
+# It was hand-written once, on the store's first day, and went on claiming one
+# repository was backed up while the store held 78.
+_TREE = [
+    {"path": "drsamonline__ml-kit/2026-10-24T095823Z/ml-kit.tar.gz", "type": "blob", "size": 8947},
+    {"path": "drsamonline__ml-kit/2026-10-25T101010Z/ml-kit.tar.gz", "type": "blob", "size": 9000},
+    {"path": "drsamonline__forge/2026-10-27T124846Z/forge.tar.gz", "type": "blob", "size": 685311},
+    # none of the following is a dump, and none may be indexed
+    {"path": "README.md", "type": "blob", "size": 173},
+    {"path": "LICENSE", "type": "blob", "size": 4604},
+    {"path": "manifest.json", "type": "blob", "size": 477},
+    {"path": ".github/workflows/x.yml", "type": "blob", "size": 100},
+    {"path": "drsamonline__ml-kit/2026-10-24T095823Z", "type": "tree", "size": 0},
+    {"path": "drsamonline__ml-kit/loose-file.txt", "type": "blob", "size": 5},
+]
+_doc = B.manifest_from(_TREE, "2026-10-27T180000Z")
+ok("the manifest lists every repository that has a dump",
+   sorted(_doc["dumps"]) == ["drsamonline__forge", "drsamonline__ml-kit"])
+ok("...and only real dumps are indexed", _doc["snapshots"] == 3)
+ok("...and nothing else in the repo is mistaken for a dump",
+   "manifest.json" not in _doc["dumps"] and ".github" not in _doc["dumps"])
+ok("a file loose in a repository folder is not a dump",
+   all(s["file"].endswith(".tar.gz") for v in _doc["dumps"].values() for s in v))
+ok("snapshots are ordered oldest first",
+   [s["at"] for s in _doc["dumps"]["drsamonline__ml-kit"]]
+   == ["2026-10-24T095823Z", "2026-10-25T101010Z"])
+ok("the totals are counted, not guessed", _doc["repositories"] == 2 and _doc["bytes"] == 8947 + 9000 + 685311)
+ok("each snapshot names its source repository",
+   _doc["dumps"]["drsamonline__forge"][0]["source"] == "drsamonline/forge")
+ok("the index says when it was generated", _doc["generated_at"] == "2026-10-27T180000Z")
+ok("an empty store produces an empty index, not an error",
+   B.manifest_from([], "x")["repositories"] == 0 and B.manifest_from([], "x")["dumps"] == {})
+ok("the index is stable across runs", B.manifest_from(_TREE, "a")["dumps"] == B.manifest_from(_TREE, "b")["dumps"])
+
+def _write_with(tree, truncated=False, put_sha=None):
+    """Run write_manifest against a fake API."""
+    orig = B.call
+    body = {}
+    def fake(method, path, token, data=None, raw=False, timeout=180):
+        if path.endswith("/git/trees/main?recursive=1"):
+            return {"tree": tree, "truncated": truncated}
+        if path.endswith("/contents/" + B.MANIFEST):
+            if method == "GET":
+                return {"_error": 404}
+            body.update(data)
+            return {"content": {"sha": put_sha if put_sha is not None else "0" * 40}}
+        if method == "GET" and "/repos/" in path:
+            return {"default_branch": "main"}
+        return {}
+    B.call = fake
+    try:
+        return B.write_manifest("o", "dumps", "t", log=lambda *_: None), body
+    finally:
+        B.call = orig
+
+rc, body = _write_with(_TREE)
+ok("a truncated tree does not get written as an index", rc == 1)
+rc, body = _write_with(_TREE[:1], put_sha=None)
+ok("a manifest whose stored sha does not match is rejected", rc == 1)
+import base64 as _b64, json as _json
+_want = B.git_blob_sha(_json.dumps(B.manifest_from(_TREE[:1], B.stamp()), indent=1).encode() + b"\n")
+rc, body = _write_with(_TREE[:1], put_sha=_want)
+ok("a manifest that lands intact is accepted", rc == 0)
 
 print(f"\n{pass_} passed, {fail} failed")
 sys.exit(1 if fail else 0)

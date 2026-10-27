@@ -90,6 +90,26 @@ source repository is already public.
 | `--public` | off | create new dumps repos public (read the warning above) |
 | `--restore-test` | — | do not back up: unpack one dump and compare it with the commit it holds |
 | `--at` | the newest | with `--restore-test`, which snapshot to restore |
+| `--manifest` | — | do not back up: regenerate the dumps repo's `manifest.json` from its tree |
+
+## The manifest is derived, not written by hand
+
+`<dumps>/manifest.json` is regenerated from the dumps repository's own tree — after every
+backup, and on demand:
+
+```bash
+GITHUB_TOKEN=... python3 backup.py --manifest --dumps dumps
+```
+
+It was hand-written once, on the store's first day, and never again: it went on claiming
+one repository was backed up while the store held 78. A derived index cannot drift, and if
+it is wrong then the tree it was derived from is wrong too. It is verified on the way in
+exactly as a dump is — the stored blob sha is compared with the sha of the bytes written —
+and a manifest that cannot be written **fails the run**, because a derived index allowed to
+go stale quietly is the defect this replaces.
+
+The one thing it does not record is the commit each dump holds. That is inside the tarball;
+`--restore-test` reads it.
 
 ## Proving a backup can actually be restored
 
@@ -116,7 +136,7 @@ Run it from the workflow by dispatching `backup` with `restore_test: true`.
 
 ```
 python3 tests/test_backup.py
-36 passed, 0 failed
+50 passed, 0 failed
 ```
 
 The tests cover the decisions that must be right — rotation keeps the newest N and deletes
