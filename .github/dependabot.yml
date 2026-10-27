@@ -1,0 +1,11 @@
+# Dependabot keeps the pinned action SHAs in this repository current.
+# Pinning without an updater freezes the estate; this is the updater (F-24, F-86).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
