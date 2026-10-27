@@ -24,8 +24,10 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import sys
+import tarfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -130,6 +132,135 @@ def git_blob_sha(data: bytes) -> str:
     h.update(b"blob %d\0" % len(data))
     h.update(data)
     return h.hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# --restore-test: unpack ONE snapshot and prove it rebuilds the repository
+# --------------------------------------------------------------------------- #
+def parse_tarball_root(top):
+    """'drsamonline-forge-57d64d9...' -> ('drsamonline', 'forge', '57d64d9...').
+
+    GitHub's tarball API wraps the whole repository in ONE directory named
+    <owner>-<repo>-<sha>. That name is the only record inside a dump of WHICH
+    commit it holds, so a restore test begins by reading it.
+    """
+    bits = top.rsplit("-", 2)
+    if len(bits) != 3 or not all(bits):
+        raise SystemExit(f"cannot read <owner>-<repo>-<sha> from the tarball top directory {top!r}")
+    return bits[0], bits[1], bits[2]
+
+
+def restored_tree(blob):
+    """(top directory, {path: git blob sha}) for every file inside a .tar.gz.
+
+    Every member is read to the end, which is what verifies the gzip CRC: a
+    truncated or corrupted dump raises here rather than passing quietly.
+    """
+    out, tops = {}, set()
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+        for m in tf:
+            name = m.name
+            while name.startswith("./"):
+                name = name[2:]
+            if not name or name == "pax_global_header":
+                continue
+            top, _, rel = name.partition("/")
+            tops.add(top)
+            if m.isfile() and rel:
+                fh = tf.extractfile(m)
+                if fh is not None:
+                    out[rel] = git_blob_sha(fh.read())
+    if len(tops) != 1:
+        raise SystemExit(f"a GitHub tarball has one top-level directory; this has {sorted(tops)}")
+    return tops.pop(), out
+
+
+def compare_trees(restored, tree):
+    """(missing, extra, altered) between a restored dump and the commit it claims."""
+    missing = sorted(set(tree) - set(restored))
+    extra = sorted(set(restored) - set(tree))
+    altered = sorted(p for p in set(restored) & set(tree) if restored[p] != tree[p])
+    return missing, extra, altered
+
+
+def commit_tree(owner, repo, sha, token):
+    """({path: blob sha}, truncated) for every file at one commit."""
+    r = call("GET", f"/repos/{owner}/{repo}/git/trees/{sha}?recursive=1", token)
+    if isinstance(r, dict) and r.get("_error"):
+        raise SystemExit(f"could not read the tree of {owner}/{repo}@{sha[:12]}: {r}")
+    blobs = {i["path"]: i["sha"] for i in r.get("tree", []) if i.get("type") == "blob"}
+    return blobs, bool(r.get("truncated"))
+
+
+def dump_blob(dump_owner, dumps, path, token):
+    """The raw bytes of a dump, through the blobs API so a dump of any size works."""
+    meta = call("GET", f"/repos/{dump_owner}/{dumps}/contents/{path}", token)
+    if isinstance(meta, dict) and meta.get("_error"):
+        raise SystemExit(f"could not read {dumps}/{path}: {meta}")
+    sha = (meta or {}).get("sha") if isinstance(meta, dict) else None
+    if not sha:
+        raise SystemExit(f"could not read {dumps}/{path}: the response carries no blob sha")
+    raw = call("GET", f"/repos/{dump_owner}/{dumps}/git/blobs/{sha}", token)
+    if isinstance(raw, dict) and raw.get("_error"):
+        raise SystemExit(f"could not read blob {sha}: {raw}")
+    if not isinstance(raw, dict) or raw.get("encoding") != "base64":
+        raise SystemExit(f"unexpected encoding for {dumps}/{path}: {(raw or {}).get('encoding')!r}")
+    blob = base64.b64decode(raw.get("content") or "")
+    if raw.get("size") is not None and len(blob) != raw["size"]:
+        raise SystemExit(f"{dumps}/{path}: decoded {len(blob)} bytes, the API reports {raw['size']}")
+    return blob, sha
+
+
+def restore_test(src_owner, src_repo, dump_owner, dumps, at, token):
+    """Unpack ONE snapshot and compare it, file by file, with the commit it holds.
+
+    This is the answer to "a backup workflow that ran is not proof of
+    recoverability". It exits 0 only when the restored tree is byte-for-byte the
+    repository at the commit the dump names: nothing missing, nothing extra,
+    nothing altered.
+    """
+    folder = folder_for(src_owner, src_repo)
+    stamps = list_dump_folders(dump_owner, dumps, folder, token)
+    if not stamps:
+        print(f"  FAIL  {dump_owner}/{dumps} holds no dumps for {src_owner}/{src_repo}")
+        return 1
+    at = at or stamps[-1]
+    if at not in stamps:
+        print(f"  FAIL  no dump at {at} for {src_owner}/{src_repo}; "
+              f"have {stamps[0]} .. {stamps[-1]} ({len(stamps)} of them)")
+        return 1
+    path = f"{folder}/{at}/{src_repo}.tar.gz"
+    print(f"restore test: {dump_owner}/{dumps}/{path}")
+
+    blob, stored = dump_blob(dump_owner, dumps, path, token)
+    print(f"  read {len(blob)/1e6:.2f} MB; the API's stored blob sha is {stored[:10]}")
+
+    try:
+        top, restored = restored_tree(blob)
+    except (tarfile.TarError, OSError, EOFError) as e:
+        print(f"  FAIL  the dump will not unpack: {type(e).__name__}: {e}")
+        return 1
+    got_owner, got_repo, commit = parse_tarball_root(top)
+    if (got_owner, got_repo) != (src_owner, src_repo):
+        print(f"  FAIL  this dump holds {got_owner}/{got_repo}, not {src_owner}/{src_repo}")
+        return 1
+    print(f"  unpacks clean (gzip CRC verified): {len(restored)} files, taken at {commit[:12]}")
+
+    tree, truncated = commit_tree(src_owner, src_repo, commit, token)
+    if truncated:
+        print(f"  FAIL  GitHub truncated the tree of {commit[:12]}; the comparison is "
+              f"incomplete, which is not a pass")
+        return 1
+    missing, extra, altered = compare_trees(restored, tree)
+    if not (missing or extra or altered):
+        print(f"  PASS  EXACT RESTORE - {len(restored)} files match "
+              f"{src_owner}/{src_repo}@{commit[:12]} file for file")
+        return 0
+    print(f"  FAIL  restored {len(restored)} files, the commit has {len(tree)}")
+    for label, items in (("missing", missing), ("extra", extra), ("altered", altered)):
+        if items:
+            print(f"        {label} ({len(items)}): {', '.join(items[:5])}")
+    return 1
 
 
 def list_dump_folders(owner, dumps, folder, token):
@@ -281,6 +412,10 @@ def main(argv=None):
                     help="dump EVERY repo the token can see (one workflow, one secret, in one repo)")
     ap.add_argument("--check", action="store_true",
                     help="do not back up: verify the token can read the source and write the dumps repo")
+    ap.add_argument("--restore-test", action="store_true",
+                    help="do not back up: unpack one dump and compare it, file by file, with the commit it holds")
+    ap.add_argument("--at", default="",
+                    help="with --restore-test: which snapshot (a YYYY-MM-DDTHHMMSSZ folder). Default: the newest")
     a = ap.parse_args(argv)
 
     import os
@@ -321,6 +456,9 @@ def main(argv=None):
     if a.check:
         print(f"token check: {a.repo}  ->  {dump_owner}/{a.dumps}")
         return check(src_owner, src_repo, dump_owner, a.dumps, token)
+
+    if a.restore_test:
+        return restore_test(src_owner, src_repo, dump_owner, a.dumps, a.at, token)
 
     print(f"backup: {a.repo} @ {ref}  ->  {dump_owner}/{a.dumps}")
     blob = tarball(src_owner, src_repo, ref, token)

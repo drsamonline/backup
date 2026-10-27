@@ -88,12 +88,35 @@ source repository is already public.
 | `--keep` | `100` | backups kept per repository; the oldest beyond it are deleted |
 | `--max-bytes` | `800 MB` | the dumps repo size cap before rolling to a new repo |
 | `--public` | off | create new dumps repos public (read the warning above) |
+| `--restore-test` | — | do not back up: unpack one dump and compare it with the commit it holds |
+| `--at` | the newest | with `--restore-test`, which snapshot to restore |
+
+## Proving a backup can actually be restored
+
+A backup that ran is not a backup that restores. This unpacks one dump and compares it,
+file for file, with the commit the dump names — every file's git blob sha against the
+repository's own tree at that commit. It exits 0 only on an exact match:
+
+```bash
+GITHUB_TOKEN=... python3 backup.py --restore-test --repo drsamonline/forge
+GITHUB_TOKEN=... python3 backup.py --restore-test --repo drsamonline/forge --at 2026-10-27T124846Z
+```
+
+```
+  read 0.69 MB; the API's stored blob sha is 81bbcaf0af
+  unpacks clean (gzip CRC verified): 349 files, taken at 57d64d93c932
+  PASS  EXACT RESTORE - 349 files match drsamonline/forge@57d64d93c932 file for file
+```
+
+It also fails on a truncated dump, on a dump whose top directory names a different
+repository, and on a tree GitHub truncated — an incomplete comparison is never a pass.
+Run it from the workflow by dispatching `backup` with `restore_test: true`.
 
 ## Verified
 
 ```
 python3 tests/test_backup.py
-17 passed, 0 failed
+36 passed, 0 failed
 ```
 
 The tests cover the decisions that must be right — rotation keeps the newest N and deletes

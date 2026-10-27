@@ -34,6 +34,11 @@ on:
         type: number
         required: false
         default: 800
+      restore_test:
+        description: "Do NOT back up. Unpack the newest dump and compare it, file for file, with the commit it holds."
+        type: boolean
+        required: false
+        default: false
     secrets:
       BACKUP_TOKEN:
         description: "A token with contents:write on the dumps repo and contents:read on the source."
@@ -96,3 +101,26 @@ jobs:
             ${{ inputs.dumps_owner != '' && format('--owner {0}', inputs.dumps_owner) || '' }} \
             --keep ${{ inputs.keep }} \
             --max-bytes $(( ${{ inputs.max_mb }} * 1024 * 1024 ))
+
+  # PROVE THE BACKUP IS RECOVERABLE, on demand. A backup workflow that ran is not
+  # proof of recoverability - this unpacks one dump and compares it with the commit
+  # it holds. Read-only: it writes nothing, and it is off unless asked for.
+  restore:
+    if: inputs.restore_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # was @v4
+        with:
+          repository: drsamonline/backup
+          path: .backup
+      - name: Unpack one dump and compare it with its commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 .backup/backup.py \
+            --restore-test \
+            --repo "${{ github.repository }}" \
+            --dumps "${{ inputs.dumps_repo }}" \
+            ${{ inputs.dumps_owner != '' && format('--owner {0}', inputs.dumps_owner) || '' }}

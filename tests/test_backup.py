@@ -128,5 +128,58 @@ ok("a dump whose stored sha matches is accepted", _dump_with(B.git_blob_sha(_dat
 ok("a dump whose stored sha does NOT match is REJECTED", _dump_with("0" * 40) is False)
 ok("a dump with no sha reported is accepted, and says it is unverified", _dump_with("") is True)
 
+# ---- a restore test: unpack a dump and compare it with the commit it holds (F-43) ----
+# "A backup workflow that ran" is not proof of recoverability. The dump has to
+# unpack, name the commit it holds, and match that commit file for file.
+import io as _io, tarfile as _tarfile
+
+def _tar(files, top="o-r-deadbeef"):
+    """A tarball shaped like GitHub's: one top-level <owner>-<repo>-<sha> directory."""
+    buf = _io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for path, data in files.items():
+            ti = _tarfile.TarInfo(f"{top}/{path}")
+            ti.size = len(data)
+            tf.addfile(ti, _io.BytesIO(data))
+    return buf.getvalue()
+
+_blob = _tar({"a.txt": b"one", "sub/b.txt": b"two"})
+_top, _tree = B.restored_tree(_blob)
+ok("a dump unpacks to one git blob sha per file",
+   _top == "o-r-deadbeef" and _tree == {"a.txt": B.git_blob_sha(b"one"),
+                                        "sub/b.txt": B.git_blob_sha(b"two")})
+ok("the top directory names the commit the dump holds",
+   B.parse_tarball_root(_top) == ("o", "r", "deadbeef"))
+try:
+    B.parse_tarball_root("nonsense")
+    ok("a top directory that is not <owner>-<repo>-<sha> is refused", False)
+except SystemExit:
+    ok("a top directory that is not <owner>-<repo>-<sha> is refused", True)
+
+try:
+    B.restored_tree(_blob[:len(_blob) // 2])
+    ok("a TRUNCATED dump is rejected, not accepted quietly", False)
+except Exception:
+    ok("a TRUNCATED dump is rejected, not accepted quietly", True)
+
+_two = _io.BytesIO()
+with _tarfile.open(fileobj=_two, mode="w:gz") as tf:
+    for name in ("o-r-aaa/x.txt", "other-repo-bbb/y.txt"):
+        ti = _tarfile.TarInfo(name); ti.size = 1
+        tf.addfile(ti, _io.BytesIO(b"z"))
+try:
+    B.restored_tree(_two.getvalue())
+    ok("a dump holding two repositories is refused", False)
+except SystemExit:
+    ok("a dump holding two repositories is refused", True)
+
+# the comparison itself
+ok("an exact restore reports nothing", B.compare_trees({"a": "1", "b": "2"}, {"a": "1", "b": "2"}) == ([], [], []))
+ok("a missing file is reported", B.compare_trees({"a": "1"}, {"a": "1", "b": "2"})[0] == ["b"])
+ok("an extra file is reported", B.compare_trees({"a": "1", "b": "2"}, {"a": "1"})[1] == ["b"])
+ok("an altered file is reported", B.compare_trees({"a": "9"}, {"a": "1"})[2] == ["a"])
+ok("a restore is not exact if anything differs",
+   B.compare_trees({"a": "9", "b": "2", "c": "3"}, {"a": "1", "b": "2", "d": "4"}) != ([], [], []))
+
 print(f"\n{pass_} passed, {fail} failed")
 sys.exit(1 if fail else 0)
