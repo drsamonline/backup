@@ -52,7 +52,7 @@ class Fake:
             return {"_error": 404}
         if method == "POST" and path == "/user/repos":
             self.created.append(data["name"]); self.payloads.append(dict(data))
-            self.sizes[data["name"]] = 0
+            self.sizes[data["name"]] = 1024        # auto_init: a README commit, so 1 KB
             return {"name": data["name"]}
         return {}
 
@@ -263,6 +263,64 @@ import base64 as _b64, json as _json
 _want = B.git_blob_sha(_json.dumps(B.manifest_from(_TREE[:1], B.stamp()), indent=1).encode() + b"\n")
 rc, body = _write_with(_TREE[:1], put_sha=_want)
 ok("a manifest that lands intact is accepted", rc == 0)
+
+
+# ---- --rollover-test: the guards that keep it off real data (F-61) ----
+# The rollover DECISION is proven above. These assert the SAFETY of the live test,
+# because it creates repositories: a mistake here would be a destructive mistake.
+import contextlib as _ctx, io as _io
+
+def _rollover(*argv):
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        try:
+            B.main(list(argv))
+            rc = 0
+        except SystemExit as e:
+            rc = 1
+            print(str(e))
+    return rc, buf.getvalue()
+
+rc, out = _rollover("--rollover-test", "--scratch", "dumps", "--token", "fake")
+ok("--rollover-test refuses the real dumps repo", rc != 0 and "zz-rollover-test" in out)
+rc, out = _rollover("--rollover-test", "--scratch", "dumps-2", "--token", "fake")
+ok("--rollover-test refuses a rolled-over dumps repo", rc != 0)
+rc, out = _rollover("--rollover-test", "--scratch", "myapp", "--token", "fake")
+ok("--rollover-test refuses any name without the scratch prefix", rc != 0)
+
+class RollFake:
+    """A stub GitHub for the live-test path: remembers what it was asked to create."""
+    def __init__(self):
+        self.sizes = {}; self.created = []; self.payloads = []
+    def __call__(self, method, path, token, data=None, raw=False, timeout=180):
+        if method == "GET" and path.startswith("/repos/"):
+            name = path.split("/")[-1]
+            return {"size": self.sizes[name] // 1024} if name in self.sizes else {"_error": 404}
+        if method == "POST" and path == "/user/repos":
+            self.created.append(data["name"]); self.payloads.append(dict(data))
+            self.sizes[data["name"]] = 1024     # auto_init: a README commit, so 1 KB
+            return {"name": data["name"]}
+        return {}
+
+_orig = B.call
+rf = RollFake()
+B.call = rf
+try:
+    rc = B.rollover_test("o", "zz-rollover-test", "t", log=lambda *_: None)
+finally:
+    B.call = _orig
+ok("the live test rolls over and returns 0", rc == 0)
+ok("...having created the scratch repo and its successor",
+   rf.created == ["zz-rollover-test", "zz-rollover-test-2"])
+ok("...both created PRIVATE, because they hold source code",
+   len(rf.payloads) == 2 and all(p.get("private") is True for p in rf.payloads))
+# Only the SCRATCH repo is ours to describe; the successor is created by
+# pick_dumps_repo itself, with the estate's normal backup description. Asserting
+# "safe to delete" on both would be asserting something the code does not claim.
+ok("...and the scratch repo is described as safe to delete",
+   "Safe to delete" in (rf.payloads[0].get("description") or ""))
+ok("...while the successor carries the normal backup description",
+   "Pre-merge backups" in (rf.payloads[1].get("description") or ""))
 
 print(f"\n{pass_} passed, {fail} failed")
 sys.exit(1 if fail else 0)

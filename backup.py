@@ -484,6 +484,82 @@ def check(src_owner, src_repo, dump_owner, dumps, token):
 
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# --rollover-test: prove the rollover against the LIVE API, on a scratch repo
+# --------------------------------------------------------------------------- #
+def rollover_test(owner, scratch, token, log=print):
+    """Create a scratch dumps repo, force the cap, and prove pick_dumps_repo rolls over.
+
+    The DECISION is already proven offline (tests/test_backup.py drives pick_dumps_repo
+    against a stubbed API). What has never been proven is the live call: creating a real
+    repository, which needs `administration: write`. That is the whole reason this
+    function exists, and the reason F-61 stayed open.
+
+    `--max-bytes 1` is the trick: any repo that exists is already "full", so the very
+    first call must roll over. No 800 MB of data is needed to exercise the path.
+
+    It only ever touches names beginning with the scratch prefix, and it refuses to run
+    if the scratch name is the real dumps repo.
+    """
+    if not scratch.startswith("zz-rollover-test"):
+        raise SystemExit(f"refusing: the scratch name must start with zz-rollover-test (got {scratch!r})")
+    if scratch == "dumps" or scratch.startswith("dumps-"):
+        raise SystemExit("refusing: that is the real dumps repo")
+
+    made = []
+    try:
+        # 1. the scratch repo must exist, so the first candidate is "full" at 1 byte
+        info = call("GET", f"/repos/{owner}/{scratch}", token)
+        if isinstance(info, dict) and info.get("_error") == 404:
+            log(f"  creating {owner}/{scratch} (scratch) ...")
+            r = call("POST", "/user/repos", token, {
+                "name": scratch, "private": True, "auto_init": True,
+                "description": "Scratch repo for backup.py --rollover-test. Safe to delete.",
+            })
+            if isinstance(r, dict) and r.get("_error"):
+                raise SystemExit(f"could not create the scratch repo: {r}\n"
+                                 "  This is the `administration: write` failure F-61 describes.")
+            made.append(scratch)
+        elif isinstance(info, dict) and info.get("_error"):
+            raise SystemExit(f"could not read {owner}/{scratch}: {info}")
+
+        # 2. force the cap to 1 byte and ask the REAL function which repo to use.
+        #    The trick only works if the scratch repo reports at least 1 byte: an
+        #    auto-initialised repo has a README commit, so GitHub reports >= 1 KB.
+        #    Check the assumption rather than trusting it - a 0-byte repo would make
+        #    this test silently pass by NOT rolling over.
+        fresh = call("GET", f"/repos/{owner}/{scratch}", token)
+        size_kb = (fresh.get("size") or 0) if isinstance(fresh, dict) else 0
+        if size_kb < 1:
+            raise SystemExit(
+                f"{owner}/{scratch} reports {size_kb} KB, so a 1-byte cap cannot make it "
+                "'full' and this test would prove nothing.\n"
+                "  Re-run in a minute (GitHub updates the size field asynchronously), or "
+                "delete the scratch repo and let this recreate it.")
+        log(f"  scratch repo reports {size_kb} KB, so a 1-byte cap makes it 'full'")
+        log("  asking pick_dumps_repo with a 1-byte cap, so any existing repo is 'full' ...")
+        chosen = pick_dumps_repo(owner, scratch, token, 1, private=True, log=log)
+        expected = f"{scratch}-2"
+        if chosen != expected:
+            raise SystemExit(f"FAILED: expected rollover to {expected}, got {chosen}")
+        log(f"  PASSED: rolled over to {chosen}")
+
+        # 3. the rolled-over repo must really exist now
+        info2 = call("GET", f"/repos/{owner}/{chosen}", token)
+        if isinstance(info2, dict) and info2.get("_error"):
+            raise SystemExit(f"FAILED: {chosen} was returned but does not exist: {info2}")
+        made.append(chosen)
+        log(f"  PASSED: {owner}/{chosen} exists")
+        log("")
+        log("  rollover is verified against the live API.")
+        log(f"  clean up with:  gh repo delete {owner}/{scratch} --yes")
+        log(f"                  gh repo delete {owner}/{chosen} --yes")
+        return 0
+    finally:
+        if made:
+            log(f"  (created this run: {', '.join(made)})")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Snapshot a repo before it changes.")
     ap.add_argument("--repo", default="", help="owner/name of the SOURCE repo (not needed with --all)")
@@ -506,12 +582,22 @@ def main(argv=None):
                     help="do not back up: unpack one dump and compare it, file by file, with the commit it holds")
     ap.add_argument("--at", default="",
                     help="with --restore-test: which snapshot (a YYYY-MM-DDTHHMMSSZ folder). Default: the newest")
+    ap.add_argument("--rollover-test", action="store_true",
+                    help="do not back up: prove the rollover against the LIVE API on a scratch repo "
+                         "(needs administration: write)")
+    ap.add_argument("--scratch", default="zz-rollover-test",
+                    help="with --rollover-test: the scratch repo name (must start with zz-rollover-test)")
     a = ap.parse_args(argv)
 
     import os
     token = a.token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
     if not token:
         raise SystemExit("no token: set GITHUB_TOKEN (contents:write on the dumps repo, contents:read on the source)")
+
+    if a.rollover_test:
+        owner = a.owner or (a.repo.split("/")[0] if "/" in a.repo else "drsamonline")
+        print(f"rollover test against {owner}/{a.scratch} (live API)")
+        return rollover_test(owner, a.scratch, token)
 
     if a.all:
         owner = a.owner or (a.repo.split("/")[0] if "/" in a.repo else "drsamonline")
