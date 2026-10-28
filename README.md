@@ -2,6 +2,8 @@
 
 # backup
 
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-2e7d32)](LICENSE)
+
 **Snapshot a repository before it changes — so a merge can never lose the code that was there.**
 
 A reusable GitHub workflow + a zero-dependency script. Compressed, timestamped, rotated, and never full.
