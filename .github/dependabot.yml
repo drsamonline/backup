@@ -1,11 +1,30 @@
 # Dependabot keeps the pinned action SHAs in this repository current.
 # Pinning without an updater freezes the estate; this is the updater (F-24, F-86).
+#
+# The shape below is deliberate, and it is the same in every repo in the fleet:
+#   * one pull request per week per ecosystem, not five (open-pull-requests-limit: 1)
+#   * every action bump that is minor or patch arrives GROUPED into that one PR
+#   * a major action bump is ignored here on purpose. A major changes the Node
+#     runtime the action runs on and can reshape its inputs and outputs, so it is
+#     a decision to make deliberately, not a chore to merge 50 times.
+# To take a major: bump it by hand, or delete the `ignore:` block for one run.
 version: 2
 updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "ci"
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: weekly
+  open-pull-requests-limit: 1
+  commit-message:
+    prefix: ci
+  groups:
+    actions:
+      patterns:
+      - '*'
+      update-types:
+      - minor
+      - patch
+  ignore:
+  - dependency-name: '*'
+    update-types:
+    - version-update:semver-major
