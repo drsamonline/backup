@@ -60,6 +60,43 @@ def call(method, path, token, data=None, raw=False, timeout=180):
         return {"_error": e.code, "_detail": detail}
 
 
+# --------------------------------------------------------------------------- #
+# 7z -mx=9 instead of gzip. LZMA2 usually beats gzip by 15-25% on a source tarball,
+# which matters when the store is measured in gigabytes.
+#
+# THE RULE: a dump is only stored as 7z if it is proven readable first. GitHub hands us a
+# .tar.gz; we recompress it, immediately decompress it again, and compare the bytes with
+# the original. If anything about that fails - 7z missing, the round trip differs, the
+# result is not smaller - the gzip tarball is stored instead. A backup is never written in
+# a format it cannot be read back from.
+# --------------------------------------------------------------------------- #
+SEVEN_ZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
+
+
+def _7z(args, data):
+    return subprocess.run(["7z"] + args, input=data, capture_output=True, timeout=900)
+
+
+def compress_7z(gz_bytes):
+    """Recompress a .tar.gz with 7z -mx=9. Returns the bytes, or None."""
+    try:
+        r = _7z(["a", "-si", "-so", "-t7z", "-mx=9", "-mmt=on"], gz_bytes)
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout.startswith(SEVEN_ZIP_MAGIC):
+        return None
+    return r.stdout
+
+
+def decompress_7z(blob):
+    """Back to the original bytes. Returns None if 7z is missing or the archive is bad."""
+    try:
+        r = _7z(["x", "-si", "-so", "-y"], blob)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout else None
+
+
 def tarball(owner, repo, ref, token):
     """The whole repository at `ref`, already tar+gzipped by GitHub."""
     return call("GET", f"/repos/{owner}/{repo}/tarball/{ref}", token, raw=True)
@@ -122,11 +159,11 @@ def manifest_from(entries, generated_at=""):
             continue
         g = groups.setdefault((folder, when), {"tar": None, "desc": None, "part_bytes": 0})
         size = int(e.get("size") or 0)
-        if name.endswith(".tar.gz"):
+        if name.endswith(".tar.gz") or name.endswith(".tar.7z"):
             g["tar"] = (e["path"], size)
-        elif name.endswith(".tar.gz.parts.json"):
+        elif name.endswith(".tar.gz.parts.json") or name.endswith(".tar.7z.parts.json"):
             g["desc"] = e["path"]
-        elif ".tar.gz.part" in name:
+        elif ".tar.gz.part" in name or ".tar.7z.part" in name:
             g["part_bytes"] += size
 
     for (folder, when), g in sorted(groups.items()):
@@ -291,6 +328,11 @@ def restored_tree(blob):
     Every member is read to the end, which is what verifies the gzip CRC: a
     truncated or corrupted dump raises here rather than passing quietly.
     """
+    if blob[:6] == SEVEN_ZIP_MAGIC:
+        raw = decompress_7z(blob)
+        if raw is None:
+            raise SystemExit("this dump is 7z and 7z is not available to read it")
+        blob = raw
     out, tops = {}, set()
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
         for m in tf:
@@ -664,7 +706,7 @@ def write_via_git(dump_owner, dumps, path, blob, message, token, log=print, extr
         shutil.rmtree(work, ignore_errors=True)
 
 
-def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=print):
+def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=print, seven_zip=True):
     """Fetch one repo's tarball and write it into the dumps repo. Returns True/False."""
     blob = tarball(src_owner, src_repo, ref, token)
     if isinstance(blob, dict):
@@ -673,6 +715,26 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     folder = folder_for(src_owner, src_repo)
     when = stamp()
     path = f"{folder}/{when}/{src_repo}.tar.gz"
+
+    # 7z -mx=9 instead of gzip, but ONLY if it can be read straight back and is smaller.
+    # The round trip is the whole safety argument: a dump is never stored in a format it
+    # cannot be restored from, and a compression step that gains nothing is not worth the
+    # dependency.
+    if seven_zip:
+        packed = compress_7z(blob)
+        if packed is None:
+            log(f"  {src_repo}: 7z unavailable or failed - keeping the gzip tarball")
+        else:
+            back = decompress_7z(packed)
+            if back is None or hashlib.sha256(back).hexdigest() != hashlib.sha256(blob).hexdigest():
+                log(f"  {src_repo}: 7z round trip did NOT match - keeping the gzip tarball")
+            elif len(packed) >= len(blob):
+                log(f"  {src_repo}: 7z was no smaller ({len(packed)} vs {len(blob)} bytes) - keeping gzip")
+            else:
+                log(f"  {src_repo}: 7z -mx=9 {len(blob)/1e6:.2f} MB -> {len(packed)/1e6:.2f} MB "
+                    f"({100 - 100.0*len(packed)/len(blob):.0f}% smaller), round trip verified")
+                blob = packed
+                path = f"{folder}/{when}/{src_repo}.tar.7z"
     # Over the per-file ceiling: do not bother attempting a write that will be refused.
     if len(blob) >= CHUNK:
         log("  %s: %.1f MB is over the per-file ceiling - storing it in parts"
@@ -869,6 +931,8 @@ def main(argv=None):
     ap.add_argument("--dumps", default="dumps", help="the dumps repo name (default: dumps)")
     ap.add_argument("--owner", default="", help="the dumps repo owner (default: the source owner)")
     ap.add_argument("--keep", type=int, default=100, help="how many dumps to keep per repo (default 100)")
+    ap.add_argument("--no-7z", action="store_true",
+                    help="store GitHub's gzip tarball as-is instead of recompressing with 7z -mx=9")
     ap.add_argument("--max-bytes", type=int, default=800 * 1024 * 1024,
                     help="the dumps repo size cap before rolling to a new repo (default 800 MB)")
     ap.add_argument("--public", action="store_true",
@@ -909,7 +973,8 @@ def main(argv=None):
         print(f"  {len(names)} repos")
         done, failed = 0, []
         for name in names:
-            if dump_one(owner, name, owner, dumps, token, a.keep):
+            if dump_one(owner, name, owner, dumps, token, a.keep,
+                        seven_zip=not a.no_7z):
                 done += 1
             else:
                 failed.append(name)
