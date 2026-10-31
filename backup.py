@@ -330,54 +330,39 @@ def commit_tree(owner, repo, sha, token):
 # 40 MB, not 90. The contents API's ceiling applies to the REQUEST BODY, and the body is
 # base64 - a third larger than the bytes. A 94.4 MB chunk was refused as "too large"
 # because it travelled as a ~126 MB request. 40 MB raw is ~53 MB on the wire, with room.
-CHUNK = 40 * 1024 * 1024
+# 80 MB raw. The git path is the one that can carry a large file - the contents API
+# refused even a 41.9 MB part as "too large" - and a push accepts up to 100 MB per file.
+CHUNK = 80 * 1024 * 1024
 
 
 def write_chunked(dump_owner, dumps, path, blob, token, log=print):
-    """Store a dump too large for one file as numbered parts plus a descriptor.
+    """Store a dump too large for one file as numbered parts, pushed in ONE commit.
 
-    WHY: HCS and ziptastic each produce a tarball over GitHub's 100 MB per-file limit.
-    Neither the contents API nor a git push will take them, so those two repositories
-    had NO backup at all. Splitting the *repository* does not help - the problem is one
-    file - so the file itself is split.
+    WHY GIT AND NOT THE CONTENTS API: HCS and ziptastic exceed GitHub's per-file limit,
+    and the contents API refused even a 41.9 MB part with "file is too large". A git push
+    carries up to 100 MB per file, so the parts travel that way - all of them in a single
+    commit, so a dump is either fully there or not there at all.
 
-    The descriptor records the part count, the total size and the sha256 of the whole,
-    so a restore can prove it reassembled the right bytes rather than merely some bytes.
+    The descriptor records the part count, the total size and the sha256 of the whole, so
+    a restore can prove it reassembled the right bytes rather than merely some bytes.
     """
     size = len(blob)
-    parts = [blob[i:i + CHUNK] for i in range(0, size, CHUNK)] or [b""]
-    shas = []
-    for n, part in enumerate(parts, 1):
-        p = "%s.part%03d" % (path, n)
-        res = call("PUT", "/repos/%s/%s/contents/%s" % (dump_owner, dumps, p), token, {
-            "message": "backup: part %d/%d of %s" % (n, len(parts), path),
-            "content": base64.b64encode(part).decode()})
-        if isinstance(res, dict) and res.get("_error"):
-            detail = (res.get("_detail") or "").strip().replace("\n", " ")[:200]
-            log("  %s: part %d (%.1f MB) could not be written (%s) %s"
-                % (path, n, len(part) / 1e6, res.get("_error"), detail))
-            return False
-        got = ((res.get("content") or {}).get("sha") or "")
-        want = git_blob_sha(part)
-        if got and got != want:
-            log("  %s: INTEGRITY FAILURE on part %d - stored %s != sent %s"
-                % (path, n, got[:10], want[:10]))
-            return False
-        shas.append(got)
-
-    desc = {"parts": len(parts), "size": size,
+    pieces = [blob[i:i + CHUNK] for i in range(0, size, CHUNK)] or [b""]
+    extra, shas = {}, []
+    for n, piece in enumerate(pieces, 1):
+        rel = "%s.part%03d" % (path, n)
+        extra[rel] = piece
+        shas.append(git_blob_sha(piece))
+    desc = {"parts": len(pieces), "size": size,
             "sha256": hashlib.sha256(blob).hexdigest(), "part_shas": shas}
-    body = json.dumps(desc, indent=1).encode()
-    dpath = path + ".parts.json"
-    res = call("PUT", "/repos/%s/%s/contents/%s" % (dump_owner, dumps, dpath), token, {
-        "message": "backup: %d parts of %s" % (len(parts), path),
-        "content": base64.b64encode(body).decode()})
-    if isinstance(res, dict) and res.get("_error"):
-        log("  %s: descriptor could not be written (%s)" % (dpath, res.get("_error")))
-        return False
-    log("  %s: stored as %d part(s), %.2f MB total, sha256 %s"
-        % (path, len(parts), size / 1e6, desc["sha256"][:12]))
-    return True
+    extra[path + ".parts.json"] = json.dumps(desc, indent=1).encode()
+
+    log("  %s: %.1f MB in %d part(s) via git push" % (path, size / 1e6, len(pieces)))
+    ok = write_via_git(dump_owner, dumps, path, blob, "backup: %s (%d parts)" % (path, len(pieces)),
+                       token, log=log, extra=extra)
+    if ok:
+        log("  %s: %d part(s) pushed, sha256 %s" % (path, len(pieces), desc["sha256"][:12]))
+    return ok
 
 
 def dump_blob(dump_owner, dumps, path, token):
@@ -567,7 +552,7 @@ def all_repos(owner, token):
     return names
 
 
-def write_via_git(dump_owner, dumps, path, blob, message, token, log=print):
+def write_via_git(dump_owner, dumps, path, blob, message, token, log=print, extra=None):
     """Write one dump by committing it in a clone and pushing.
 
     WHY THIS EXISTS: the contents API refuses a large file with
@@ -618,12 +603,16 @@ def write_via_git(dump_owner, dumps, path, blob, message, token, log=print):
             log("  %s: read-tree failed: %s" % (dumps, (r.stderr or "").strip()[:200]))
             return False
 
-        dest = os.path.join(repo, path)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "wb") as fh:
-            fh.write(blob)
+        payload = {path: blob}
+        if extra:
+            payload.update(extra)
+        for rel, data in payload.items():
+            dest = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as fh:
+                fh.write(data)
 
-        for step in (("add", "--", path), ("commit", "-m", message)):
+        for step in (("add", "--") + tuple(payload.keys()), ("commit", "-m", message)):
             r = git(*step)
             if r.returncode != 0:
                 log("  %s: %s failed: %s" % (dumps, step[0], (r.stderr or "").strip()[:200]))
