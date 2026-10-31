@@ -656,8 +656,9 @@ def write_via_git(dump_owner, dumps, path, blob, message, token, log=print, extr
                 % (dumps, remote_head[:10], local_head[:10]))
             return False
 
-        log("  %s/%s: pushed %.2f MB, blob %s confirmed on main"
-            % (dumps, path, len(blob) / 1e6, want[:10]))
+        total = sum(len(d) for d in payload.values())
+        log("  %s/%s: pushed %d file(s), %.2f MB, every blob sha confirmed on main"
+            % (dumps, path, len(payload), total / 1e6))
         return True
     finally:
         shutil.rmtree(work, ignore_errors=True)
