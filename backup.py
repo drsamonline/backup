@@ -107,6 +107,10 @@ def manifest_from(entries, generated_at=""):
     cannot drift, and if it is wrong the tree it was derived from is wrong too.
     """
     dumps, total = {}, 0
+    # A dump is EITHER one tarball OR numbered parts with a descriptor. Grouping first
+    # matters: a chunked dump has no .tar.gz at all, so a check that looked only for that
+    # name would silently drop the two repositories that most needed backing up.
+    groups = {}
     for e in entries:
         if e.get("type") not in (None, "blob"):
             continue
@@ -114,11 +118,27 @@ def manifest_from(entries, generated_at=""):
         if len(parts) != 3:
             continue
         folder, when, name = parts
-        if not name.endswith(".tar.gz") or "T" not in when or not when.endswith("Z"):
+        if "T" not in when or not when.endswith("Z"):
             continue
+        g = groups.setdefault((folder, when), {"tar": None, "desc": None, "part_bytes": 0})
         size = int(e.get("size") or 0)
+        if name.endswith(".tar.gz"):
+            g["tar"] = (e["path"], size)
+        elif name.endswith(".tar.gz.parts.json"):
+            g["desc"] = e["path"]
+        elif ".tar.gz.part" in name:
+            g["part_bytes"] += size
+
+    for (folder, when), g in sorted(groups.items()):
+        if g["tar"]:
+            path, size = g["tar"]
+        elif g["desc"]:
+            path, size = g["desc"], g["part_bytes"]
+        else:
+            continue
         dumps.setdefault(folder, []).append(
-            {"at": when, "file": e["path"], "bytes": size,
+            {"at": when, "file": path, "bytes": size,
+             "chunked": bool(g["desc"] and not g["tar"]),
              "source": folder.replace("__", "/", 1)})
         total += size
     for snaps in dumps.values():
@@ -197,8 +217,9 @@ def stored_bytes(owner, name, token):
     for e in tree.get("tree") or []:
         if e.get("type") != "blob":
             continue
-        if (e.get("path") or "").endswith(".tar.gz"):
-            total += int(e.get("size") or 0)
+        bits = (e.get("path") or "").split("/")
+        if len(bits) == 3 and "T" in bits[1] and bits[1].endswith("Z"):
+            total += int(e.get("size") or 0)   # tarballs, .partNNN pieces and descriptors
     return total
 
 
@@ -306,8 +327,91 @@ def commit_tree(owner, repo, sha, token):
     return blobs, bool(r.get("truncated"))
 
 
+CHUNK = 90 * 1024 * 1024          # under GitHub's 100 MB per-file ceiling
+
+
+def write_chunked(dump_owner, dumps, path, blob, token, log=print):
+    """Store a dump too large for one file as numbered parts plus a descriptor.
+
+    WHY: HCS and ziptastic each produce a tarball over GitHub's 100 MB per-file limit.
+    Neither the contents API nor a git push will take them, so those two repositories
+    had NO backup at all. Splitting the *repository* does not help - the problem is one
+    file - so the file itself is split.
+
+    The descriptor records the part count, the total size and the sha256 of the whole,
+    so a restore can prove it reassembled the right bytes rather than merely some bytes.
+    """
+    size = len(blob)
+    parts = [blob[i:i + CHUNK] for i in range(0, size, CHUNK)] or [b""]
+    shas = []
+    for n, part in enumerate(parts, 1):
+        p = "%s.part%03d" % (path, n)
+        res = call("PUT", "/repos/%s/%s/contents/%s" % (dump_owner, dumps, p), token, {
+            "message": "backup: part %d/%d of %s" % (n, len(parts), path),
+            "content": base64.b64encode(part).decode()})
+        if isinstance(res, dict) and res.get("_error"):
+            log("  %s: part %d could not be written (%s)" % (path, n, res.get("_error")))
+            return False
+        got = ((res.get("content") or {}).get("sha") or "")
+        want = git_blob_sha(part)
+        if got and got != want:
+            log("  %s: INTEGRITY FAILURE on part %d - stored %s != sent %s"
+                % (path, n, got[:10], want[:10]))
+            return False
+        shas.append(got)
+
+    desc = {"parts": len(parts), "size": size,
+            "sha256": hashlib.sha256(blob).hexdigest(), "part_shas": shas}
+    body = json.dumps(desc, indent=1).encode()
+    dpath = path + ".parts.json"
+    res = call("PUT", "/repos/%s/%s/contents/%s" % (dump_owner, dumps, dpath), token, {
+        "message": "backup: %d parts of %s" % (len(parts), path),
+        "content": base64.b64encode(body).decode()})
+    if isinstance(res, dict) and res.get("_error"):
+        log("  %s: descriptor could not be written (%s)" % (dpath, res.get("_error")))
+        return False
+    log("  %s: stored as %d part(s), %.2f MB total, sha256 %s"
+        % (path, len(parts), size / 1e6, desc["sha256"][:12]))
+    return True
+
+
 def dump_blob(dump_owner, dumps, path, token):
-    """The raw bytes of a dump, through the blobs API so a dump of any size works."""
+    """The raw bytes of a dump, through the blobs API so a dump of any size works.
+
+    A chunked dump has no single file: it is numbered parts plus a descriptor. It is
+    reassembled here and checked against the descriptor's size and sha256, so a caller
+    that asks for a path gets the same bytes back whether it was stored in one piece or
+    twenty.
+    """
+    dpath = path + ".parts.json"
+    dmeta = call("GET", f"/repos/{dump_owner}/{dumps}/contents/{dpath}", token)
+    if isinstance(dmeta, dict) and not dmeta.get("_error") and dmeta.get("sha"):
+        draw = call("GET", f"/repos/{dump_owner}/{dumps}/git/blobs/{dmeta['sha']}", token)
+        if isinstance(draw, dict) and draw.get("_error"):
+            raise SystemExit(f"could not read {dpath}: {draw}")
+        desc = json.loads(base64.b64decode(draw.get("content") or ""))
+        chunks = []
+        for n in range(1, int(desc.get("parts") or 0) + 1):
+            p = "%s.part%03d" % (path, n)
+            m = call("GET", f"/repos/{dump_owner}/{dumps}/contents/{p}", token)
+            if not isinstance(m, dict) or m.get("_error"):
+                raise SystemExit(f"chunked dump {path}: part {n} is missing ({m})")
+            b = call("GET", f"/repos/{dump_owner}/{dumps}/git/blobs/{m.get('sha')}", token)
+            if not isinstance(b, dict) or b.get("_error"):
+                raise SystemExit(f"chunked dump {path}: part {n} unreadable ({b})")
+            data = base64.b64decode(b.get("content") or "")
+            if b.get("size") is not None and len(data) != b["size"]:
+                raise SystemExit(f"chunked dump {path}: part {n} decoded {len(data)} "
+                                 f"bytes, the API reports {b['size']}")
+            chunks.append(data)
+        blob = b"".join(chunks)
+        if len(blob) != desc.get("size"):
+            raise SystemExit(f"chunked dump {path}: reassembled {len(blob)} bytes, "
+                             f"descriptor says {desc.get('size')}")
+        if hashlib.sha256(blob).hexdigest() != desc.get("sha256"):
+            raise SystemExit(f"chunked dump {path}: sha256 does not match the descriptor")
+        return blob, dmeta["sha"]
+
     meta = call("GET", f"/repos/{dump_owner}/{dumps}/contents/{path}", token)
     if isinstance(meta, dict) and meta.get("_error"):
         raise SystemExit(f"could not read {dumps}/{path}: {meta}")
@@ -551,6 +655,21 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     folder = folder_for(src_owner, src_repo)
     when = stamp()
     path = f"{folder}/{when}/{src_repo}.tar.gz"
+    # Over the per-file ceiling: do not bother attempting a write that will be refused.
+    if len(blob) >= CHUNK:
+        log("  %s: %.1f MB is over the per-file ceiling - storing it in parts"
+            % (src_repo, len(blob) / 1e6))
+        if not write_chunked(dump_owner, dumps, path, blob, token, log=log):
+            log("  %s: NOT BACKED UP - the chunked write failed" % src_repo)
+            return False
+        have = list_dump_folders(dump_owner, dumps, folder, token)
+        for old in dumps_to_delete(have, keep):
+            if not delete_folder(dump_owner, dumps, f"{folder}/{old}", token, log=log):
+                log("  %s: rotation could NOT delete %s" % (src_repo, old))
+        log("  %s: %.2f MB -> %s (in parts, kept %d)"
+            % (src_repo, len(blob) / 1e6, path, min(len(have), keep)))
+        return True
+
     via_git = False
     put = call("PUT", f"/repos/{dump_owner}/{dumps}/contents/{path}", token, {
         "message": f"backup: {src_owner}/{src_repo} ({when})",
