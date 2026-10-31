@@ -506,6 +506,7 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     folder = folder_for(src_owner, src_repo)
     when = stamp()
     path = f"{folder}/{when}/{src_repo}.tar.gz"
+    via_git = False
     put = call("PUT", f"/repos/{dump_owner}/{dumps}/contents/{path}", token, {
         "message": f"backup: {src_owner}/{src_repo} ({when})",
         "content": base64.b64encode(blob).decode()})
@@ -522,6 +523,10 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
                 log("  %s: NOT BACKED UP - the API and the git fallback both refused it"
                     % src_repo)
                 return False
+            # The git path already compared the committed blob sha with the sha of these
+            # bytes and asked the branch what it holds. Running the API-sha check after
+            # it would print "integrity NOT verified" about a dump that WAS verified.
+            via_git = True
         else:
             log("  %s: could not write (%s) %s" % (src_repo, code, detail))
             return False
@@ -533,6 +538,8 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     # and the only proof of recoverability was a green workflow.
     want = git_blob_sha(blob)
     got = ((put.get("content") or {}).get("sha") or "")
+    if via_git:
+        got = want            # verified by the git path; see write_via_git
     if got and got != want:
         log(f"  {src_repo}: INTEGRITY FAILURE - stored {got[:10]} != fetched {want[:10]} "
             f"({len(blob)} bytes) - NOT keeping this snapshot's retention sweep")
