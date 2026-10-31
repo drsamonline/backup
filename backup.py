@@ -411,7 +411,11 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
         "message": f"backup: {src_owner}/{src_repo} ({when})",
         "content": base64.b64encode(blob).decode()})
     if isinstance(put, dict) and put.get("_error"):
-        log(f"  {src_repo}: could not write ({put.get('_error')})")
+        # Print the API's own words, not just the status. "(422)" alone cannot tell a
+        # file over the 100 MB contents-API limit from a validation error, and those
+        # need completely different fixes.
+        detail = (put.get("_detail") or "").strip().replace("\n", " ")[:200]
+        log(f"  {src_repo}: could not write ({put.get('_error')}) {detail}")
         return False
 
     # VERIFY WHAT LANDED. A successful PUT only means the request was accepted; it is
