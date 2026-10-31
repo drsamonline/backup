@@ -182,6 +182,26 @@ def write_manifest(dump_owner, dumps, token, log=print):
 # --------------------------------------------------------------------------- #
 # The dumps repo: pick one under the cap, creating the next if it is full
 # --------------------------------------------------------------------------- #
+def stored_bytes(owner, name, token):
+    """How much dump payload a dumps repo actually holds, from its own tree.
+
+    WHY NOT `info["size"]`: the repository API's `size` lags badly. The dumps repo was
+    reported as 653 MB while its manifest said 1778 MB, so the rollover cap was being
+    checked against a number days out of date - which is why it never rolled over and
+    the store kept growing past its own limit. The tree is the source of truth.
+    """
+    tree = call("GET", f"/repos/{owner}/{name}/git/trees/main?recursive=1", token)
+    if not isinstance(tree, dict) or tree.get("_error"):
+        return None
+    total = 0
+    for e in tree.get("tree") or []:
+        if e.get("type") != "blob":
+            continue
+        if (e.get("path") or "").endswith(".tar.gz"):
+            total += int(e.get("size") or 0)
+    return total
+
+
 def pick_dumps_repo(owner, base, token, cap_bytes, private=True, log=print):
     """The first of base, base-2, base-3, ... that exists and is under the cap.
 
@@ -203,7 +223,11 @@ def pick_dumps_repo(owner, base, token, cap_bytes, private=True, log=print):
             return name
         if isinstance(info, dict) and info.get("_error"):
             raise SystemExit(f"could not read {owner}/{name}: {info}")
-        size = (info.get("size") or 0) * 1024          # the API reports KB
+        # Prefer what the tree says over what the repository API reports: `size` lags.
+        size = stored_bytes(owner, name, token)
+        if size is None:
+            size = (info.get("size") or 0) * 1024      # the API reports KB
+            log(f"  {owner}/{name}: tree unreadable, falling back to the API size")
         if size < cap_bytes:
             log(f"  using {owner}/{name} ({size/1e6:.1f} MB of {cap_bytes/1e6:.0f} MB)")
             return name
