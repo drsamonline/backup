@@ -26,6 +26,8 @@ import base64
 import hashlib
 import io
 import json
+import os
+import subprocess
 import sys
 import tarfile
 import urllib.error
@@ -398,6 +400,103 @@ def all_repos(owner, token):
     return names
 
 
+def write_via_git(dump_owner, dumps, path, blob, message, token, log=print):
+    """Write one dump by committing it in a clone and pushing.
+
+    WHY THIS EXISTS: the contents API refuses a large file with
+        422 "Sorry, the file is too large to be processed.
+             Consider creating/updating the file in a local clone and pushing it."
+    Two repositories hit that ceiling (HCS 125 MB, The_Browser 165 MB) and were never
+    backed up at all. This is GitHub's own suggested route.
+
+    THREE WAYS THIS COULD SILENTLY DESTROY BACKUPS, avoided:
+      * a `--no-checkout` clone has an EMPTY index, so `git add` + commit would write a
+        tree holding only the new file and delete every other snapshot. `git read-tree
+        HEAD` populates the index from the commit first.
+      * the token must not go in the remote URL where `git remote -v` would print it.
+        It travels in an http extraheader.
+      * a push that exits 0 is a claim about a command. The committed blob sha is
+        compared with the sha of the bytes we meant to store, and the branch is asked
+        afterwards what it holds.
+    """
+    import shutil
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="dumps-git-")
+    repo = os.path.join(work, "repo")
+    url = "https://github.com/%s/%s.git" % (dump_owner, dumps)
+    auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
+    header = "AUTHORIZATION: basic " + auth
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
+               GIT_AUTHOR_NAME="backup-bot",
+               GIT_AUTHOR_EMAIL="backup@users.noreply.github.com",
+               GIT_COMMITTER_NAME="backup-bot",
+               GIT_COMMITTER_EMAIL="backup@users.noreply.github.com")
+
+    def git(*args, cwd=None):
+        return subprocess.run(["git", "-c", "http.https://github.com/.extraheader=" + header]
+                              + list(args),
+                              cwd=cwd or repo, capture_output=True, text=True, env=env)
+
+    try:
+        log("  %s/%s: too large for the contents API - falling back to git push" % (dumps, path))
+        # blob:none keeps this cheap on a repository already holding 1.6 GB: we want the
+        # history and trees, not every snapshot's bytes.
+        r = git("clone", "--filter=blob:none", "--no-checkout", url, repo, cwd=work)
+        if r.returncode != 0:
+            log("  %s: clone failed: %s" % (dumps, (r.stderr or "").strip()[:200]))
+            return False
+        r = git("read-tree", "HEAD")
+        if r.returncode != 0:
+            log("  %s: read-tree failed: %s" % (dumps, (r.stderr or "").strip()[:200]))
+            return False
+
+        dest = os.path.join(repo, path)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as fh:
+            fh.write(blob)
+
+        for step in (("add", "--", path), ("commit", "-m", message)):
+            r = git(*step)
+            if r.returncode != 0:
+                log("  %s: %s failed: %s" % (dumps, step[0], (r.stderr or "").strip()[:200]))
+                return False
+
+        want = git_blob_sha(blob)
+        got = (git("rev-parse", "HEAD:%s" % path).stdout or "").strip()
+        if got != want:
+            log("  %s/%s: INTEGRITY FAILURE - committed %s != intended %s - not pushing"
+                % (dumps, path, got[:10], want[:10]))
+            return False
+
+        pushed = False
+        for attempt in range(1, 4):
+            r = git("push", "origin", "HEAD:main")
+            if r.returncode == 0:
+                pushed = True
+                break
+            log("  %s: push attempt %d rejected: %s"
+                % (dumps, attempt, (r.stderr or "").strip()[:150]))
+            if git("fetch", "--filter=blob:none", "origin", "main").returncode == 0:
+                git("rebase", "origin/main")
+        if not pushed:
+            return False
+
+        local_head = (git("rev-parse", "HEAD").stdout or "").strip()
+        remote = (git("ls-remote", "origin", "refs/heads/main").stdout or "").split()
+        remote_head = remote[0] if remote else ""
+        if remote_head != local_head:
+            log("  %s: pushed, but main is %s and we committed %s - NOT verified"
+                % (dumps, remote_head[:10], local_head[:10]))
+            return False
+
+        log("  %s/%s: pushed %.2f MB, blob %s confirmed on main"
+            % (dumps, path, len(blob) / 1e6, want[:10]))
+        return True
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=print):
     """Fetch one repo's tarball and write it into the dumps repo. Returns True/False."""
     blob = tarball(src_owner, src_repo, ref, token)
@@ -411,12 +510,21 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
         "message": f"backup: {src_owner}/{src_repo} ({when})",
         "content": base64.b64encode(blob).decode()})
     if isinstance(put, dict) and put.get("_error"):
-        # Print the API's own words, not just the status. "(422)" alone cannot tell a
-        # file over the 100 MB contents-API limit from a validation error, and those
-        # need completely different fixes.
+        code = put.get("_error")
         detail = (put.get("_detail") or "").strip().replace("\n", " ")[:200]
-        log(f"  {src_repo}: could not write ({put.get('_error')}) {detail}")
-        return False
+        # 422 "file is too large to be processed" is a ceiling, not a fault: the same
+        # bytes go in by committing in a clone and pushing. Anything else is a real
+        # failure and is reported as one, with the API's own words.
+        if code == 422 and "too large" in detail.lower():
+            if not write_via_git(dump_owner, dumps, path, blob,
+                                 "backup: %s/%s (%s)" % (src_owner, src_repo, when),
+                                 token, log=log):
+                log("  %s: NOT BACKED UP - the API and the git fallback both refused it"
+                    % src_repo)
+                return False
+        else:
+            log("  %s: could not write (%s) %s" % (src_repo, code, detail))
+            return False
 
     # VERIFY WHAT LANDED. A successful PUT only means the request was accepted; it is
     # not evidence that the stored object is complete. The response carries the stored
