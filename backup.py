@@ -71,29 +71,52 @@ def call(method, path, token, data=None, raw=False, timeout=180):
 # a format it cannot be read back from.
 # --------------------------------------------------------------------------- #
 SEVEN_ZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
+LAST_7Z_ERR = ""
 
 
-def _7z(args, data):
-    return subprocess.run(["7z"] + args, input=data, capture_output=True, timeout=900)
+def _7z(args, data=None, timeout=900):
+    return subprocess.run(["7z"] + args, input=data, capture_output=True, timeout=timeout)
 
 
 def compress_7z(gz_bytes):
-    """Recompress a .tar.gz with 7z -mx=9. Returns the bytes, or None."""
-    try:
-        r = _7z(["a", "-si", "-so", "-t7z", "-mx=9", "-mmt=on"], gz_bytes)
-    except Exception:
-        return None
-    if r.returncode != 0 or not r.stdout.startswith(SEVEN_ZIP_MAGIC):
-        return None
-    return r.stdout
+    """Recompress a .tar.gz with 7z -mx=9. Returns the bytes, or None.
+
+    Through a temporary file, not -si/-so: p7zip does not reliably support streaming
+    archive CREATION to stdout, and the first attempt failed for all 94 repositories
+    because of it. Extraction to stdout is supported, so decompression streams fine.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="7z-") as d:
+        src = os.path.join(d, "in.tar.gz")
+        out = os.path.join(d, "out.7z")
+        with open(src, "wb") as fh:
+            fh.write(gz_bytes)
+        global LAST_7Z_ERR
+        try:
+            r = _7z(["a", "-t7z", "-mx=9", "-mmt=on", "-y", out, src])
+        except Exception as exc:
+            LAST_7Z_ERR = "%s: %s" % (type(exc).__name__, exc)
+            return None
+        if r.returncode != 0 or not os.path.exists(out):
+            LAST_7Z_ERR = ((r.stderr or r.stdout or b"").decode("utf-8", "replace")
+                           .strip().splitlines() or ["7z exited %d" % r.returncode])[-1][:200]
+            return None
+        with open(out, "rb") as fh:
+            data = fh.read()
+    return data if data.startswith(SEVEN_ZIP_MAGIC) else None
 
 
 def decompress_7z(blob):
     """Back to the original bytes. Returns None if 7z is missing or the archive is bad."""
-    try:
-        r = _7z(["x", "-si", "-so", "-y"], blob)
-    except Exception:
-        return None
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="7z-") as d:
+        src = os.path.join(d, "in.7z")
+        with open(src, "wb") as fh:
+            fh.write(blob)
+        try:
+            r = _7z(["x", "-so", "-y", src])
+        except Exception:
+            return None
     return r.stdout if r.returncode == 0 and r.stdout else None
 
 
@@ -723,7 +746,7 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     if seven_zip:
         packed = compress_7z(blob)
         if packed is None:
-            log(f"  {src_repo}: 7z unavailable or failed - keeping the gzip tarball")
+            log(f"  {src_repo}: 7z failed ({LAST_7Z_ERR or 'no detail'}) - keeping the gzip tarball")
         else:
             back = decompress_7z(packed)
             if back is None or hashlib.sha256(back).hexdigest() != hashlib.sha256(blob).hexdigest():
