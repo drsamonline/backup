@@ -624,12 +624,16 @@ def write_via_git(dump_owner, dumps, path, blob, message, token, log=print, extr
                 log("  %s: %s failed: %s" % (dumps, step[0], (r.stderr or "").strip()[:200]))
                 return False
 
-        want = git_blob_sha(blob)
-        got = (git("rev-parse", "HEAD:%s" % path).stdout or "").strip()
-        if got != want:
-            log("  %s/%s: INTEGRITY FAILURE - committed %s != intended %s - not pushing"
-                % (dumps, path, got[:10], want[:10]))
-            return False
+        # Verify EVERY file we committed, not just one: in chunked mode the payload is
+        # several parts plus a descriptor, and checking only the first would let a bad
+        # part through on the strength of a good neighbour.
+        for rel, data in payload.items():
+            want = git_blob_sha(data)
+            got = (git("rev-parse", "HEAD:%s" % rel).stdout or "").strip()
+            if got != want:
+                log("  %s/%s: INTEGRITY FAILURE - committed %s != intended %s - not pushing"
+                    % (dumps, rel, got[:10], want[:10]))
+                return False
 
         pushed = False
         for attempt in range(1, 4):
