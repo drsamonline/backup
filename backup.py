@@ -95,7 +95,7 @@ def compress_7z(tar_bytes):
         src = os.path.join(d, "in.tar")
         out = os.path.join(d, "out.7z")
         with open(src, "wb") as fh:
-            fh.write(gz_bytes)
+            fh.write(tar_bytes)
         global LAST_7Z_ERR
         try:
             r = _7z(["a", "-t7z", "-mx=9", "-mmt=on", "-y", out, src])
