@@ -327,7 +327,10 @@ def commit_tree(owner, repo, sha, token):
     return blobs, bool(r.get("truncated"))
 
 
-CHUNK = 90 * 1024 * 1024          # under GitHub's 100 MB per-file ceiling
+# 40 MB, not 90. The contents API's ceiling applies to the REQUEST BODY, and the body is
+# base64 - a third larger than the bytes. A 94.4 MB chunk was refused as "too large"
+# because it travelled as a ~126 MB request. 40 MB raw is ~53 MB on the wire, with room.
+CHUNK = 40 * 1024 * 1024
 
 
 def write_chunked(dump_owner, dumps, path, blob, token, log=print):
