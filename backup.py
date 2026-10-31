@@ -350,7 +350,9 @@ def write_chunked(dump_owner, dumps, path, blob, token, log=print):
             "message": "backup: part %d/%d of %s" % (n, len(parts), path),
             "content": base64.b64encode(part).decode()})
         if isinstance(res, dict) and res.get("_error"):
-            log("  %s: part %d could not be written (%s)" % (path, n, res.get("_error")))
+            detail = (res.get("_detail") or "").strip().replace("\n", " ")[:200]
+            log("  %s: part %d (%.1f MB) could not be written (%s) %s"
+                % (path, n, len(part) / 1e6, res.get("_error"), detail))
             return False
         got = ((res.get("content") or {}).get("sha") or "")
         want = git_blob_sha(part)
@@ -529,9 +531,21 @@ def delete_folder(owner, dumps, path, token, log=None):
 # --------------------------------------------------------------------------- #
 SKIP = {"dumps", "backup", "drsamonline", "drsamonline.github.io"}
 
+
+def _is_dump_store(name):
+    """dumps, dumps-2, dumps-3 ... are where backups live, never what gets backed up."""
+    n = (name or "").lower()
+    return n == "dumps" or n.startswith("dumps-")
+
 def all_repos(owner, token):
-    """Every repo the token can see: the owner's own (private included) if it can,
-    otherwise the public ones. Tooling repos are skipped."""
+    """Every repo the token can see, minus the stores and the meta repos.
+
+    The dump stores are excluded by pattern rather than by name: dumps-2 was created
+    during a rollover and the very next run tried to back it up, which is nonsense - it
+    is the place backups are written, not a source.
+
+    Falls back to the public list when the token cannot see private repos.
+    """
     out, page = [], 1
     while True:
         batch = call("GET", f"/user/repos?per_page=100&page={page}&affiliation=owner", token)
@@ -545,7 +559,8 @@ def all_repos(owner, token):
         page += 1
     names = sorted(r["name"] for r in out
                    if r.get("owner", {}).get("login", owner) == owner
-                   and r["name"] not in SKIP and not r.get("fork") and not r.get("archived"))
+                   and r["name"] not in SKIP and not _is_dump_store(r["name"])
+                   and not r.get("fork") and not r.get("archived"))
     return names
 
 
