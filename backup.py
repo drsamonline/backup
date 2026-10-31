@@ -337,17 +337,29 @@ def git_blob_sha(data: bytes) -> str:
 # --------------------------------------------------------------------------- #
 # --restore-test: unpack ONE snapshot and prove it rebuilds the repository
 # --------------------------------------------------------------------------- #
-def parse_tarball_root(top):
-    """'drsamonline-forge-57d64d9...' -> ('drsamonline', 'forge', '57d64d9...').
+def parse_tarball_root(top, owner=""):
+    """'drsamonline-today-card-57d64d9...' -> ('drsamonline', 'today-card', '57d64d9...').
 
     GitHub's tarball API wraps the whole repository in ONE directory named
-    <owner>-<repo>-<sha>. That name is the only record inside a dump of WHICH
-    commit it holds, so a restore test begins by reading it.
+    <owner>-<repo>-<sha>. That name is the only record inside a dump of WHICH commit it
+    holds, so a restore test begins by reading it.
+
+    IT USED TO SPLIT ON THE LAST TWO HYPHENS, which reads `drsamonline-today-card-abc` as
+    owner `drsamonline-today` and repo `card`. Every repository with a hyphen in its name -
+    which is most of them - therefore failed the restore test with a message blaming the
+    dump. The check was broken, not the backups.
+
+    The sha never contains a hyphen, so the last one separates it. What remains is
+    <owner>-<repo>, and the owner is known: match it exactly rather than guessing where
+    the boundary is.
     """
-    bits = top.rsplit("-", 2)
-    if len(bits) != 3 or not all(bits):
+    rest, _, sha = top.rpartition("-")
+    if not rest or not sha:
         raise SystemExit(f"cannot read <owner>-<repo>-<sha> from the tarball top directory {top!r}")
-    return bits[0], bits[1], bits[2]
+    if owner and rest.startswith(owner + "-"):
+        return owner, rest[len(owner) + 1:], sha
+    first, _, repo = rest.partition("-")
+    return first, repo, sha
 
 
 def restored_tree(blob):
@@ -522,7 +534,7 @@ def restore_test(src_owner, src_repo, dump_owner, dumps, at, token):
     except (tarfile.TarError, OSError, EOFError) as e:
         print(f"  FAIL  the dump will not unpack: {type(e).__name__}: {e}")
         return 1
-    got_owner, got_repo, commit = parse_tarball_root(top)
+    got_owner, got_repo, commit = parse_tarball_root(top, src_owner)
     if (got_owner, got_repo) != (src_owner, src_repo):
         print(f"  FAIL  this dump holds {got_owner}/{got_repo}, not {src_owner}/{src_repo}")
         return 1
