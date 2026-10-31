@@ -358,7 +358,10 @@ def write_chunked(dump_owner, dumps, path, blob, token, log=print):
     extra[path + ".parts.json"] = json.dumps(desc, indent=1).encode()
 
     log("  %s: %.1f MB in %d part(s) via git push" % (path, size / 1e6, len(pieces)))
-    ok = write_via_git(dump_owner, dumps, path, blob, "backup: %s (%d parts)" % (path, len(pieces)),
+    # blob=None: the parts ARE the payload. Passing the whole blob here as well made it
+    # try to push the full 133.8 MB file alongside its own parts, which is over the
+    # per-file limit and failed the entire dump.
+    ok = write_via_git(dump_owner, dumps, path, None, "backup: %s (%d parts)" % (path, len(pieces)),
                        token, log=log, extra=extra)
     if ok:
         log("  %s: %d part(s) pushed, sha256 %s" % (path, len(pieces), desc["sha256"][:12]))
@@ -591,7 +594,7 @@ def write_via_git(dump_owner, dumps, path, blob, message, token, log=print, extr
                               cwd=cwd or repo, capture_output=True, text=True, env=env)
 
     try:
-        log("  %s/%s: too large for the contents API - falling back to git push" % (dumps, path))
+        log("  %s/%s: writing through git push" % (dumps, path))
         # blob:none keeps this cheap on a repository already holding 1.6 GB: we want the
         # history and trees, not every snapshot's bytes.
         r = git("clone", "--filter=blob:none", "--no-checkout", url, repo, cwd=work)
@@ -603,9 +606,12 @@ def write_via_git(dump_owner, dumps, path, blob, message, token, log=print, extr
             log("  %s: read-tree failed: %s" % (dumps, (r.stderr or "").strip()[:200]))
             return False
 
-        payload = {path: blob}
+        payload = {} if blob is None else {path: blob}
         if extra:
             payload.update(extra)
+        if not payload:
+            log("  %s: nothing to write" % dumps)
+            return False
         for rel, data in payload.items():
             dest = os.path.join(repo, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
