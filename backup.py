@@ -387,14 +387,35 @@ def list_dump_folders(owner, dumps, folder, token):
     return sorted(i["name"] for i in items if i.get("type") == "dir")
 
 
-def delete_folder(owner, dumps, path, token):
-    """Delete a folder (a dump) via the Git trees API: remove its files, then it."""
+def delete_folder(owner, dumps, path, token, log=None):
+    """Delete a folder (a dump): remove its files, then confirm it is gone.
+
+    It used to return silently whenever the listing was not a list, and never checked
+    that a DELETE had worked - so a failed rotation looked exactly like a successful one
+    and the store kept growing. A cleanup that cannot fail loudly is not a cleanup.
+    """
     items = call("GET", f"/repos/{owner}/{dumps}/contents/{path}", token)
+    if isinstance(items, dict) and items.get("_error") == 404:
+        return True                      # already gone - the desired end state
     if not isinstance(items, list):
-        return
+        if log:
+            log(f"  rotate: could not list {path}: {items}")
+        return False
+    failed = 0
     for it in items:
-        call("DELETE", f"/repos/{owner}/{dumps}/contents/{it['path']}", token,
-             {"message": f"rotate: drop old backup {path}", "sha": it["sha"]})
+        res = call("DELETE", f"/repos/{owner}/{dumps}/contents/{it['path']}", token,
+                   {"message": f"rotate: drop old backup {path}", "sha": it["sha"]})
+        if isinstance(res, dict) and res.get("_error"):
+            failed += 1
+            if log:
+                log(f"  rotate: could not delete {it['path']} ({res.get('_error')})")
+    if failed:
+        return False
+    after = call("GET", f"/repos/{owner}/{dumps}/contents/{path}", token)
+    gone = isinstance(after, dict) and after.get("_error") == 404
+    if not gone and log:
+        log(f"  rotate: {path} still present after deleting {len(items)} file(s)")
+    return gone
 
 
 # --------------------------------------------------------------------------- #
@@ -573,7 +594,8 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
 
     have = list_dump_folders(dump_owner, dumps, folder, token)
     for old in dumps_to_delete(have, keep):
-        delete_folder(dump_owner, dumps, f"{folder}/{old}", token)
+        if not delete_folder(dump_owner, dumps, f"{folder}/{old}", token, log=log):
+            log(f"  {src_repo}: rotation could NOT delete {old} - the store will keep growing")
     log(f"  {src_repo}: {len(blob)/1e6:.2f} MB -> {dumps}/{path}  (kept {min(len(have), keep)})")
     return True
 
