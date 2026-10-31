@@ -25,6 +25,7 @@ import argparse
 import base64
 import hashlib
 import io
+import gzip
 import json
 import os
 import subprocess
@@ -78,8 +79,12 @@ def _7z(args, data=None, timeout=900):
     return subprocess.run(["7z"] + args, input=data, capture_output=True, timeout=timeout)
 
 
-def compress_7z(gz_bytes):
-    """Recompress a .tar.gz with 7z -mx=9. Returns the bytes, or None.
+def compress_7z(tar_bytes):
+    """Compress a RAW TAR with 7z -mx=9. Returns the bytes, or None.
+
+    Raw tar, not the .tar.gz GitHub gives us. Recompressing an already-gzipped stream
+    gained 0-2% - the first honest measurement - because gzip had already done the work.
+    LZMA on the uncompressed tar is where the saving actually is.
 
     Through a temporary file, not -si/-so: p7zip does not reliably support streaming
     archive CREATION to stdout, and the first attempt failed for all 94 repositories
@@ -87,7 +92,7 @@ def compress_7z(gz_bytes):
     """
     import tempfile
     with tempfile.TemporaryDirectory(prefix="7z-") as d:
-        src = os.path.join(d, "in.tar.gz")
+        src = os.path.join(d, "in.tar")
         out = os.path.join(d, "out.7z")
         with open(src, "wb") as fh:
             fh.write(gz_bytes)
@@ -351,13 +356,14 @@ def restored_tree(blob):
     Every member is read to the end, which is what verifies the gzip CRC: a
     truncated or corrupted dump raises here rather than passing quietly.
     """
+    mode = "r:gz"
     if blob[:6] == SEVEN_ZIP_MAGIC:
         raw = decompress_7z(blob)
         if raw is None:
             raise SystemExit("this dump is 7z and 7z is not available to read it")
-        blob = raw
+        blob, mode = raw, "r:"      # a 7z dump holds the uncompressed tar
     out, tops = {}, set()
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+    with tarfile.open(fileobj=io.BytesIO(blob), mode=mode) as tf:
         for m in tf:
             name = m.name
             while name.startswith("./"):
@@ -744,15 +750,21 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     # cannot be restored from, and a compression step that gains nothing is not worth the
     # dependency.
     if seven_zip:
-        packed = compress_7z(blob)
+        # Uncompressed tar in, 7z out. GitHub hands us gzip, and gzipping gzip gains
+        # nothing - measured at 0-2% before this changed.
+        try:
+            raw_tar = gzip.decompress(blob)
+        except Exception:
+            raw_tar = None
+        packed = compress_7z(raw_tar) if raw_tar else None
         if packed is None:
             log(f"  {src_repo}: 7z failed ({LAST_7Z_ERR or 'no detail'}) - keeping the gzip tarball")
         else:
             back = decompress_7z(packed)
-            if back is None or hashlib.sha256(back).hexdigest() != hashlib.sha256(blob).hexdigest():
+            if back is None or hashlib.sha256(back).hexdigest() != hashlib.sha256(raw_tar).hexdigest():
                 log(f"  {src_repo}: 7z round trip did NOT match - keeping the gzip tarball")
             elif len(packed) >= len(blob):
-                log(f"  {src_repo}: 7z was no smaller ({len(packed)} vs {len(blob)} bytes) - keeping gzip")
+                log(f"  {src_repo}: 7z was no smaller than gzip ({len(packed)} vs {len(blob)} bytes) - keeping gzip")
             else:
                 log(f"  {src_repo}: 7z -mx=9 {len(blob)/1e6:.2f} MB -> {len(packed)/1e6:.2f} MB "
                     f"({100 - 100.0*len(packed)/len(blob):.0f}% smaller), round trip verified")
