@@ -523,7 +523,20 @@ def restore_test(src_owner, src_repo, dump_owner, dumps, at, token):
         print(f"  FAIL  no dump at {at} for {src_owner}/{src_repo}; "
               f"have {stamps[0]} .. {stamps[-1]} ({len(stamps)} of them)")
         return 1
-    path = f"{folder}/{at}/{src_repo}.tar.gz"
+    # Find the file that is actually there. This used to assume `.tar.gz`, which stopped
+    # being true the moment new dumps were written as `.tar.7z`. The restore test then
+    # 404'd on every store and failed the whole backup run - blaming the backups for a
+    # filename.
+    path = ""
+    for candidate in (f"{folder}/{at}/{src_repo}.tar.7z",
+                      f"{folder}/{at}/{src_repo}.tar.gz"):
+        probe, _ = dump_blob(dump_owner, dumps, candidate, token)
+        if not isinstance(probe, dict):
+            path = candidate
+            break
+    if not path:
+        print(f"  FAIL  no dump file in {dump_owner}/{dumps}/{folder}/{at}")
+        return 1
     print(f"restore test: {dump_owner}/{dumps}/{path}")
 
     blob, stored = dump_blob(dump_owner, dumps, path, token)
