@@ -551,7 +551,8 @@ def restore_test(src_owner, src_repo, dump_owner, dumps, at, token):
     if (got_owner, got_repo) != (src_owner, src_repo):
         print(f"  FAIL  this dump holds {got_owner}/{got_repo}, not {src_owner}/{src_repo}")
         return 1
-    print(f"  unpacks clean (gzip CRC verified): {len(restored)} files, taken at {commit[:12]}")
+    fmt = "7z (LZMA2)" if path.endswith(".tar.7z") else "gzip (CRC verified)"
+    print(f"  unpacks clean, {fmt}: {len(restored)} files, taken at {commit[:12]}")
 
     tree, truncated = commit_tree(src_owner, src_repo, commit, token)
     if truncated:
