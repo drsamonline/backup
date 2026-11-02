@@ -80,7 +80,7 @@ def _7z(args, data=None, timeout=900):
     return subprocess.run(["7z"] + args, input=data, capture_output=True, timeout=timeout)
 
 
-def compress_7z(tar_bytes):
+def compress_7z(tar_bytes, big=None):
     """Compress a RAW TAR with 7z -mx=9. Returns the bytes, or None.
 
     Raw tar, not the .tar.gz GitHub gives us. Recompressing an already-gzipped stream
@@ -98,8 +98,16 @@ def compress_7z(tar_bytes):
         with open(src, "wb") as fh:
             fh.write(tar_bytes)
         global LAST_7Z_ERR
+        # -mx=9 is already the top preset; the only headroom left is the dictionary, and it
+        # only helps a file larger than the default 64 MB window. For the three big
+        # repositories it is worth a little memory; for a 200 KB tarball it is not.
+        if big is None:
+            big = len(tar_bytes) > 32 * 1024 * 1024
+        args = ["a", "-t7z", "-mx=9", "-mmt=on", "-y", out, src]
+        if big:
+            args = ["a", "-t7z", "-mx=9", "-m0=lzma2:d=256m", "-mmt=on", "-y", out, src]
         try:
-            r = _7z(["a", "-t7z", "-mx=9", "-mmt=on", "-y", out, src])
+            r = _7z(args)
         except Exception as exc:
             LAST_7Z_ERR = "%s: %s" % (type(exc).__name__, exc)
             return None
@@ -999,7 +1007,7 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
             raw_tar = gzip.decompress(blob)
         except Exception:
             raw_tar = None
-        packed = compress_7z(raw_tar) if raw_tar else None
+        packed = compress_7z(raw_tar, big=(len(raw_tar) > 32 * 1024 * 1024)) if raw_tar else None
         if packed is None:
             log(f"  {src_repo}: 7z failed ({LAST_7Z_ERR or 'no detail'}) - keeping the gzip tarball")
         else:
