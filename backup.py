@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
 import io
 import gzip
 import json
@@ -31,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import tarfile
 import urllib.error
 import urllib.request
@@ -43,23 +45,45 @@ UA = "drsamonline-backup"
 # --------------------------------------------------------------------------- #
 # The GitHub API, in about twenty lines
 # --------------------------------------------------------------------------- #
-def call(method, path, token, data=None, raw=False, timeout=180):
+def call(method, path, token, data=None, raw=False, timeout=180, attempts=4):
+    """One GitHub API request, retried through transient failures.
+
+    A backup run makes hundreds of requests over 15 minutes, and one dropped connection
+    used to end the whole run: a scheduled run on 2 November died with
+    `http.client.RemoteDisconnected: Remote end closed connection without response` while
+    rolling over to a new store. Nothing was wrong with the backup; a socket closed.
+
+    Network errors and 5xx responses are retried with backoff. A 4xx is NOT retried - it is
+    an answer, and retrying it just wastes the run.
+    """
     body = json.dumps(data).encode() if data is not None else None
     headers = {"Accept": "application/vnd.github+json", "User-Agent": UA}
     if token:
         headers["Authorization"] = "Bearer " + token
     if body is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(API + path, data=body, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = resp.read()
-            if raw:
-                return payload
-            return json.loads(payload) if payload else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:300]
-        return {"_error": e.code, "_detail": detail}
+
+    last = ""
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(API + path, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = resp.read()
+                if raw:
+                    return payload
+                return json.loads(payload) if payload else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            if e.code >= 500 and attempt < attempts:
+                last = f"HTTP {e.code}"
+            else:
+                return {"_error": e.code, "_detail": detail}
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            if attempt >= attempts:
+                break
+        time.sleep(min(2 ** attempt, 15))
+    return {"_error": "network", "_detail": f"gave up after {attempts} attempts: {last}"}
 
 
 # --------------------------------------------------------------------------- #
@@ -371,6 +395,13 @@ def pick_dumps_repo(owner, base, token, cap_bytes, private=True, log=print):
                 raise SystemExit(f"could not create {owner}/{name}: {made}")
             return name
         if isinstance(info, dict) and info.get("_error"):
+            if info.get("_error") == "network":
+                # A dropped connection is not a reason to abandon a backup run that has
+                # already written twenty repositories. Stay on the store we were about to
+                # use; if it turns out to be full, the write fails and is reported as a
+                # failed repository, which is visible - unlike a dead run.
+                log(f"  could not read {owner}/{name} (network) - carrying on with it")
+                return name
             raise SystemExit(f"could not read {owner}/{name}: {info}")
         # Prefer what the tree says over what the repository API reports: `size` lags.
         size = stored_bytes(owner, name, token)
@@ -1081,7 +1112,12 @@ def dump_one(src_owner, src_repo, dump_owner, dumps, token, keep, ref="", log=pr
     for old in dumps_to_delete(have, keep):
         if not delete_folder(dump_owner, dumps, f"{folder}/{old}", token, log=log):
             log(f"  {src_repo}: rotation could NOT delete {old} - the store will keep growing")
-    log(f"  {src_repo}: {len(blob)/1e6:.2f} MB -> {dumps}/{path}  (kept {min(len(have), keep)})")
+    if keep > 0:
+        kept_note = f"kept {min(len(have), keep)}"
+    else:
+        kept_note = (f"retention {RETENTION['days']}d/{RETENTION['weeks']}w/"
+                     f"{RETENTION['months']}m, {len(have)} snapshot(s) now")
+    log(f"  {src_repo}: {len(blob)/1e6:.2f} MB -> {dumps}/{path}  ({kept_note})")
     return True
 
 
