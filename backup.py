@@ -1239,7 +1239,17 @@ def main(argv=None):
             return 1
         return manifest_rc
 
-    if "/" not in a.repo and not (a.seed_state or a.manifest):
+    # These modes do not take a source repository, so they run before it is split.
+    if a.seed_state:
+        who = a.owner or (a.repo.split("/")[0] if "/" in a.repo else "drsamonline")
+        print(f"seed state: {who}/{a.dumps} (nothing will be downloaded)")
+        return seed_state(who, a.dumps, token)
+    if a.manifest:
+        who = a.owner or (a.repo.split("/")[0] if "/" in a.repo else "drsamonline")
+        print(f"manifest: {who}/{a.dumps}")
+        return write_manifest(who, a.dumps, token)
+
+    if "/" not in a.repo:
         raise SystemExit("--repo must be owner/name (or use --all)")
     src_owner, src_repo = a.repo.split("/", 1)
     dump_owner = a.owner or src_owner
@@ -1251,14 +1261,6 @@ def main(argv=None):
 
     if a.restore_test:
         return restore_test(src_owner, src_repo, dump_owner, a.dumps, a.at, token)
-
-    if a.manifest:
-        print(f"manifest: {dump_owner}/{a.dumps}")
-        return write_manifest(dump_owner, a.dumps, token)
-
-    if a.seed_state:
-        print(f"seed state: {dump_owner}/{a.dumps} (nothing will be downloaded)")
-        return seed_state(dump_owner, a.dumps, token)
 
     print(f"backup: {a.repo} @ {ref}  ->  {dump_owner}/{a.dumps}")
     blob = tarball(src_owner, src_repo, ref, token)
