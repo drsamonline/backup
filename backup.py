@@ -531,8 +531,7 @@ def restore_test(src_owner, src_repo, dump_owner, dumps, at, token):
     path = ""
     for candidate in (f"{folder}/{at}/{src_repo}.tar.7z",
                       f"{folder}/{at}/{src_repo}.tar.gz"):
-        probe, _ = dump_blob(dump_owner, dumps, candidate, token)
-        if not isinstance(probe, dict):
+        if blob_exists(dump_owner, dumps, candidate, token):
             path = candidate
             break
     if not path:
@@ -686,13 +685,28 @@ def repo_state(owner, repo, token):
     return branch, sha, tag
 
 
+def blob_exists(dump_owner, dumps, path, token):
+    """Does this file exist? Never raises - a missing file is an answer, not a fault.
+
+    `dump_blob` raises SystemExit when a file is absent, which is right for a dump it was
+    asked to read and wrong for a probe. That difference cost a whole backup run: the state
+    reader asked every store for a state.json that only one of them had, and the first
+    store without one exited the process silently with code 1.
+    """
+    meta = call("GET", f"/repos/{dump_owner}/{dumps}/contents/{path}", token)
+    return isinstance(meta, dict) and not meta.get("_error") and bool(meta.get("sha"))
+
+
 def read_state(dump_owner, dumps, token):
-    """The state file in one store, or {}."""
-    blob, _ = dump_blob(dump_owner, dumps, STATE_FILE, token)
-    if isinstance(blob, dict):
+    """The state file in one store, or {}. Never raises."""
+    meta = call("GET", f"/repos/{dump_owner}/{dumps}/contents/{STATE_FILE}", token)
+    if not isinstance(meta, dict) or meta.get("_error") or not meta.get("sha"):
+        return {}
+    raw = call("GET", f"/repos/{dump_owner}/{dumps}/git/blobs/{meta['sha']}", token)
+    if not isinstance(raw, dict) or raw.get("_error"):
         return {}
     try:
-        return json.loads(blob.decode("utf-8"))
+        return json.loads(base64.b64decode(raw.get("content") or ""))
     except Exception:
         return {}
 
@@ -747,6 +761,8 @@ def seed_state(owner, base, token, log=print):
     stores = dump_store_names(owner, base, token)
     newest = {}
     for st in stores:
+        if not blob_exists(owner, st, "manifest.json", token):
+            continue
         blob, _ = dump_blob(owner, st, "manifest.json", token)
         if isinstance(blob, dict):
             continue
