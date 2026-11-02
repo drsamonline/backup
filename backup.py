@@ -895,7 +895,7 @@ def seed_state(owner, base, token, log=print):
     log(f"  seed: {seeded} recorded as up to date, {len(pending)} will be backed up on the next run")
     if pending:
         log(f"  seed: pending: {', '.join(pending[:8])}" + (" ..." if len(pending) > 8 else ""))
-    dumps = pick_dumps_repo(owner, base, token, 800 * 1024 * 1024)
+    dumps = pick_dumps_repo(owner, base, token, 2 * 1024 * 1024 * 1024)
     if not write_state(owner, dumps, token, known, log=log):
         log("  seed: could not write state.json")
         return 1
@@ -1267,7 +1267,7 @@ def main(argv=None):
     ap.add_argument("--keep-months", type=int, default=12, help="then one per month for this many months (default 12)")
     ap.add_argument("--no-7z", action="store_true",
                     help="store GitHub's gzip tarball as-is instead of recompressing with 7z -mx=9")
-    ap.add_argument("--max-bytes", type=int, default=800 * 1024 * 1024,
+    ap.add_argument("--max-bytes", type=int, default=2 * 1024 * 1024 * 1024,
                     help="the dumps repo size cap before rolling to a new repo (default 800 MB)")
     ap.add_argument("--public", action="store_true",
                     help="create new dumps repos PUBLIC (default: private, because they hold source code)")
