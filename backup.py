@@ -34,7 +34,7 @@ import sys
 import tarfile
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 API = "https://api.github.com"
 UA = "drsamonline-backup"
@@ -134,16 +134,70 @@ def tarball(owner, repo, ref, token):
 # --------------------------------------------------------------------------- #
 # The two decisions, kept pure so they can be tested without a network
 # --------------------------------------------------------------------------- #
-def dumps_to_delete(names, keep):
-    """Given one repository's dump folder names (any order), which to delete.
+RETENTION = {"days": 7, "weeks": 8, "months": 12}
 
-    Keeps the newest `keep` by the timestamp in the name; deletes the rest,
-    oldest first. `keep <= 0` deletes nothing (rotation off).
+
+def parse_stamp(name):
+    """2026-11-01T192310Z -> an aware datetime, or None if it is not a stamp."""
+    try:
+        return datetime.strptime(name, "%Y-%m-%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def dumps_to_delete(names, keep=0, now=None, days=None, weeks=None, months=None):
+    """Which snapshots to DELETE - grandfather, father, son.
+
+    Counting to 100 was the old rule, and it is the wrong shape: the 100th oldest falls
+    off whether it was a quiet Tuesday or the day before a release, and a repository that
+    changed hourly crowds out the ones that changed monthly.
+
+    Instead, keep by age:
+      * everything younger than `days`
+      * then the newest snapshot in each of the last `weeks` ISO weeks
+      * then the newest in each of the last `months` months
+    Everything else goes, oldest first. The newest snapshot is never deleted.
+
+    `keep > 0` is a belt-and-braces cap on the total, for a repository that somehow
+    produces more than the age rules expect.
     """
-    if keep <= 0:
+    days = RETENTION["days"] if days is None else days
+    weeks = RETENTION["weeks"] if weeks is None else weeks
+    months = RETENTION["months"] if months is None else months
+    dated = [(parse_stamp(n), n) for n in names]
+    dated = [(d, n) for d, n in dated if d is not None]
+    if not dated:
         return []
-    ordered = sorted(names)                      # the timestamp sorts lexicographically
-    return ordered[:-keep] if len(ordered) > keep else []
+    dated.sort(reverse=True)                     # newest first
+    now = now or datetime.now(timezone.utc)
+
+    keep_set = set()
+    cutoff = now - timedelta(days=days)
+    for d, n in dated:
+        if d >= cutoff:
+            keep_set.add(n)
+
+    per_week = {}
+    for d, n in dated:
+        if d < cutoff:
+            per_week.setdefault(d.isocalendar()[:2], n)   # newest first, so first wins
+    for key in sorted(per_week, reverse=True)[:weeks]:
+        keep_set.add(per_week[key])
+
+    per_month = {}
+    for d, n in dated:
+        per_month.setdefault((d.year, d.month), n)
+    for key in sorted(per_month, reverse=True)[:months]:
+        keep_set.add(per_month[key])
+
+    keep_set.add(dated[0][1])                    # never the newest
+
+    if keep > 0 and len(keep_set) > keep:
+        keep_set = {n for _d, n in dated[:keep]}  # hard cap: the newest `keep`
+
+    doomed = [n for _d, n in dated if n not in keep_set]
+    doomed.reverse()                              # oldest first
+    return doomed
 
 
 def stamp(now=None):
@@ -1154,7 +1208,11 @@ def main(argv=None):
     ap.add_argument("--ref", default="", help="the ref about to be replaced (default: the default branch)")
     ap.add_argument("--dumps", default="dumps", help="the dumps repo name (default: dumps)")
     ap.add_argument("--owner", default="", help="the dumps repo owner (default: the source owner)")
-    ap.add_argument("--keep", type=int, default=100, help="how many dumps to keep per repo (default 100)")
+    ap.add_argument("--keep", type=int, default=0,
+                    help="a hard cap on snapshots per repo (default 0 = no cap, the age rules decide)")
+    ap.add_argument("--keep-days", type=int, default=7, help="keep every snapshot this recent (default 7)")
+    ap.add_argument("--keep-weeks", type=int, default=8, help="then one per week for this many weeks (default 8)")
+    ap.add_argument("--keep-months", type=int, default=12, help="then one per month for this many months (default 12)")
     ap.add_argument("--no-7z", action="store_true",
                     help="store GitHub's gzip tarball as-is instead of recompressing with 7z -mx=9")
     ap.add_argument("--max-bytes", type=int, default=800 * 1024 * 1024,
@@ -1192,6 +1250,10 @@ def main(argv=None):
         owner = a.owner or (a.repo.split("/")[0] if "/" in a.repo else "drsamonline")
         print(f"rollover test against {owner}/{a.scratch} (live API)")
         return rollover_test(owner, a.scratch, token)
+
+    RETENTION["days"] = a.keep_days
+    RETENTION["weeks"] = a.keep_weeks
+    RETENTION["months"] = a.keep_months
 
     if a.all:
         owner = a.owner or (a.repo.split("/")[0] if "/" in a.repo else "drsamonline")
