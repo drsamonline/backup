@@ -28,6 +28,7 @@ import io
 import gzip
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -652,6 +653,152 @@ def all_repos(owner, token):
     return names
 
 
+
+# --------------------------------------------------------------------------- #
+# Change detection. A backup of a repository that has not changed is a copy of
+# something already stored: measured on this corpus, 53% of every run was that.
+# So before downloading anything, ask what commit the default branch is at and
+# compare it with the one recorded last time. Same commit and no new tag means
+# skip. The check costs two cheap API calls; the download it avoids costs a
+# tarball, a recompress and a push.
+#
+# IF THE CHECK FAILS, THE REPOSITORY IS BACKED UP. A failed lookup is not
+# evidence of no change, and treating it as such is how a backup quietly stops
+# covering something.
+# --------------------------------------------------------------------------- #
+STATE_FILE = "state.json"
+
+
+def repo_state(owner, repo, token):
+    """(default branch, head sha, newest tag) for one repository, or None on failure."""
+    meta = call("GET", f"/repos/{owner}/{repo}", token)
+    if isinstance(meta, dict) and meta.get("_error"):
+        return None
+    branch = meta.get("default_branch") or "main"
+    head = call("GET", f"/repos/{owner}/{repo}/commits/{branch}", token)
+    if isinstance(head, dict) and head.get("_error"):
+        return None
+    sha = head.get("sha") or ""
+    if not sha:
+        return None
+    tags = call("GET", f"/repos/{owner}/{repo}/tags?per_page=1", token)
+    tag = tags[0].get("name", "") if isinstance(tags, list) and tags else ""
+    return branch, sha, tag
+
+
+def read_state(dump_owner, dumps, token):
+    """The state file in one store, or {}."""
+    blob, _ = dump_blob(dump_owner, dumps, STATE_FILE, token)
+    if isinstance(blob, dict):
+        return {}
+    try:
+        return json.loads(blob.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def dump_store_names(owner, base, token):
+    """Every store matching the base name: dumps, dumps-2, dumps-3 ..."""
+    out, page = [], 1
+    while True:
+        batch = call("GET", f"/user/repos?per_page=100&page={page}&affiliation=owner", token)
+        if not isinstance(batch, list) or not batch:
+            break
+        for r in batch:
+            n = r.get("name", "")
+            if n == base or (n.startswith(base + "-") and n[len(base) + 1:].isdigit()):
+                out.append(n)
+        if len(batch) < 100:
+            break
+        page += 1
+    return sorted(out, key=lambda n: (len(n), n))
+
+
+def read_state_all(owner, base, token):
+    """Merge the state files of every store. The newest entry per repository wins.
+
+    The state has to be read across stores, not just the one in use: snapshots roll
+    over into dumps-2, dumps-3 ..., so a repository last backed up before a rollover
+    has its record in the older store.
+    """
+    merged = {}
+    for name in dump_store_names(owner, base, token):
+        for key, entry in (read_state(owner, name, token).get("repos") or {}).items():
+            if key not in merged or (entry.get("at") or "") > (merged[key].get("at") or ""):
+                merged[key] = entry
+    return merged
+
+
+def _norm_ts(text):
+    """2026-11-01T19:23:10Z and 2026-11-01T192310Z both -> 20261101T192310."""
+    t = re.sub(r"[-:]", "", str(text or ""))
+    return t.rstrip("Z")[:15]
+
+
+def seed_state(owner, base, token, log=print):
+    """Record a starting state WITHOUT downloading anything.
+
+    The first change-triggered run would otherwise back up all 96 repositories again, which
+    is exactly the duplication the change is meant to stop. A repository whose last push is
+    no newer than its newest stored snapshot cannot have changed since that snapshot, so its
+    current head is recorded and it will be skipped. Anything newer is left unrecorded and
+    will be backed up - the seeding only ever errs toward backing something up.
+    """
+    stores = dump_store_names(owner, base, token)
+    newest = {}
+    for st in stores:
+        blob, _ = dump_blob(owner, st, "manifest.json", token)
+        if isinstance(blob, dict):
+            continue
+        try:
+            data = json.loads(blob.decode("utf-8"))
+        except Exception:
+            continue
+        for folder, lst in (data.get("dumps") or {}).items():
+            for snap in lst:
+                if _norm_ts(snap.get("at")) > newest.get(folder, ""):
+                    newest[folder] = _norm_ts(snap.get("at"))
+    log(f"  seed: newest stored snapshot known for {len(newest)} repositories across {len(stores)} stores")
+
+    known, seeded, pending = {}, 0, []
+    for name in all_repos(owner, token):
+        key = folder_for(owner, name)
+        meta = call("GET", f"/repos/{owner}/{name}", token)
+        want = repo_state(owner, name, token)
+        if isinstance(meta, dict) and meta.get("_error") or not want:
+            pending.append(name)
+            continue
+        pushed = _norm_ts(meta.get("pushed_at"))
+        stored = newest.get(key, "")
+        if stored and pushed and pushed <= stored:
+            known[key] = {"sha": want[1], "tag": want[2], "at": stored, "seeded": True}
+            seeded += 1
+        else:
+            pending.append(name)
+    log(f"  seed: {seeded} recorded as up to date, {len(pending)} will be backed up on the next run")
+    if pending:
+        log(f"  seed: pending: {', '.join(pending[:8])}" + (" ..." if len(pending) > 8 else ""))
+    dumps = pick_dumps_repo(owner, base, token, 800 * 1024 * 1024)
+    if not write_state(owner, dumps, token, known, log=log):
+        log("  seed: could not write state.json")
+        return 1
+    log(f"  seed: state.json written to {owner}/{dumps}")
+    return 0
+
+
+def write_state(dump_owner, dumps, token, known, log=print):
+    payload = {"written_by": "drsamonline/backup",
+               "note": ("The commit each repository was last backed up at. A repository whose "
+                        "head matches this is skipped: backing it up again would store a copy "
+                        "of what is already there. Deleting this file makes the next run a "
+                        "full one."),
+               "updated_at": stamp(),
+               "repos": known}
+    data = json.dumps(payload, indent=1, sort_keys=True).encode("utf-8")
+    return write_via_git(dump_owner, dumps, STATE_FILE, data,
+                         "chore(state): record the commit each repository was last backed up at",
+                         token, log=log)
+
 def write_via_git(dump_owner, dumps, path, blob, message, token, log=print, extra=None):
     """Write one dump by committing it in a clone and pushing.
 
@@ -999,6 +1146,10 @@ def main(argv=None):
     ap.add_argument("--public", action="store_true",
                     help="create new dumps repos PUBLIC (default: private, because they hold source code)")
     ap.add_argument("--token", default="", help="a token (default: $GITHUB_TOKEN / $GH_TOKEN)")
+    ap.add_argument("--seed-state", action="store_true",
+                    help="record a starting state from what is already stored, downloading nothing")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore the state file and back up every repository, changed or not")
     ap.add_argument("--all", action="store_true",
                     help="dump EVERY repo the token can see (one workflow, one secret, in one repo)")
     ap.add_argument("--check", action="store_true",
@@ -1032,16 +1183,52 @@ def main(argv=None):
         dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)
         names = all_repos(owner, token)
         print(f"  {len(names)} repos")
-        done, failed = 0, []
+
+        known = {} if a.force else read_state_all(owner, a.dumps, token)
+        if a.force:
+            print("  --force: ignoring the state file - every repository will be backed up")
+        elif known:
+            print(f"  state: {len(known)} repositories have a recorded commit")
+
+        done, failed, skipped, retagged = 0, [], [], 0
         for name in names:
+            key = folder_for(owner, name)
+            prev = known.get(key) or {}
+
+            # What commit is it on now? Two cheap calls, against a tarball download,
+            # a recompress and a push.
+            want = repo_state(owner, name, token)
+            if want and not a.force:
+                _branch, sha, tag = want
+                same_sha = bool(sha) and sha == (prev.get("sha") or "")
+                same_tag = (tag or "") == (prev.get("tag") or "")
+                if same_sha and same_tag:
+                    skipped.append(name)
+                    continue
+                if same_sha and not same_tag:
+                    # unchanged code, but a new tag: a release is worth a snapshot even
+                    # when nothing moved, because it is the one you would look for later
+                    retagged += 1
+
             if dump_one(owner, name, owner, dumps, token, a.keep,
                         seven_zip=not a.no_7z):
                 done += 1
+                if want:
+                    known[key] = {"sha": want[1], "tag": want[2], "at": stamp()}
             else:
                 failed.append(name)
             dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)  # roll over mid-run
-        print(f"  backed up {done} of {len(names)}")
+
+        print(f"  backed up {done} of {len(names)}  "
+              f"(skipped {len(skipped)} unchanged, {retagged} re-snapshotted for a new tag)")
+        if skipped:
+            print(f"  unchanged: {', '.join(skipped[:8])}"
+                  + (f" ... and {len(skipped) - 8} more" if len(skipped) > 8 else ""))
         manifest_rc = write_manifest(owner, dumps, token)
+        if known and (done or skipped):
+            if not write_state(owner, dumps, token, known):
+                print("  WARNING: could not write state.json - the next run will re-back-up everything")
+                failed.append("state.json")
         if failed:
             # A PARTIAL BACKUP IS NOT A SUCCESSFUL ONE. This returned `0 if done else 1`,
             # so 78 of 83 backed up exited 0 and the five that were missing were a log
@@ -1052,7 +1239,7 @@ def main(argv=None):
             return 1
         return manifest_rc
 
-    if "/" not in a.repo:
+    if "/" not in a.repo and not (a.seed_state or a.manifest):
         raise SystemExit("--repo must be owner/name (or use --all)")
     src_owner, src_repo = a.repo.split("/", 1)
     dump_owner = a.owner or src_owner
@@ -1068,6 +1255,10 @@ def main(argv=None):
     if a.manifest:
         print(f"manifest: {dump_owner}/{a.dumps}")
         return write_manifest(dump_owner, a.dumps, token)
+
+    if a.seed_state:
+        print(f"seed state: {dump_owner}/{a.dumps} (nothing will be downloaded)")
+        return seed_state(dump_owner, a.dumps, token)
 
     print(f"backup: {a.repo} @ {ref}  ->  {dump_owner}/{a.dumps}")
     blob = tarball(src_owner, src_repo, ref, token)
