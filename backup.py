@@ -375,13 +375,21 @@ def stored_bytes(owner, name, token):
     return total
 
 
-def pick_dumps_repo(owner, base, token, cap_bytes, private=True, log=print):
+def pick_dumps_repo(owner, base, token, cap_bytes, private=True, log=print, start=""):
     """The first of base, base-2, base-3, ... that exists and is under the cap.
 
     A dumps repo that does not exist is created. This is the whole "the repo
     creates a new repo when the size limit comes" rule.
+
+    `start` is the store currently in use, and it matters for cost: without it every call
+    began at `dumps` and walked all six stores, measuring each tree, to arrive back at the
+    one it already knew. That ran once per repository - six hundred tree walks a run - and
+    filled the log with "is full, rolling over" for stores nobody was going to use.
     """
     n = 1
+    if start:
+        m = re.match(re.escape(base) + r"-(\d+)$", start)
+        n = int(m.group(1)) if m else 1
     while True:
         name = base if n == 1 else f"{base}-{n}"
         info = call("GET", f"/repos/{owner}/{name}", token)
@@ -1339,7 +1347,9 @@ def main(argv=None):
                     known[key] = {"sha": want[1], "tag": want[2], "at": stamp()}
             else:
                 failed.append(name)
-            dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes, private=not a.public)  # roll over mid-run
+            # start from the store in use, so the common case is one check, not six
+            dumps = pick_dumps_repo(owner, a.dumps, token, a.max_bytes,
+                                    private=not a.public, start=dumps)
 
         print(f"  backed up {done} of {len(names)}  "
               f"(skipped {len(skipped)} unchanged, {retagged} re-snapshotted for a new tag)")
