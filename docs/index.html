@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>backup — snapshot a repository before it changes</title>
+<meta name="description" content="A reusable GitHub workflow and a zero-dependency script: compressed, timestamped, rotated snapshots of a repository before a merge replaces it.">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<meta name="color-scheme" content="light">
+<style>
+  :root{
+    --paper:#f7f6f2; --card:#ffffff; --ink:#14161a; --mut:#5c6470; --line:#e2ddd2;
+    --accent:#2f6b4f; --accent-ink:#ffffff; --code:#f1efe8;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 var(--sans);
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:820px;margin:0 auto;padding:56px 22px 40px}
+  h1{font-family:var(--serif);font-size:clamp(2rem,5vw,2.9rem);line-height:1.1;margin:0 0 .3em;
+     letter-spacing:-.01em}
+  .lede{font-size:1.12rem;color:var(--mut);margin:0 0 1.6em;max-width:62ch}
+  .claim{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 2.2em}
+  .big{flex:1 1 240px;background:var(--card);border:1px solid var(--line);border-radius:14px;
+       padding:18px 20px}
+  .big b{display:block;font-family:var(--serif);font-size:1.55rem;line-height:1.2;
+         color:var(--accent)}
+  .big span{display:block;font-size:.86rem;color:var(--mut);margin-top:6px}
+  .cta{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 2.4em}
+  a.btn{display:inline-block;padding:11px 18px;border-radius:10px;text-decoration:none;
+        font-weight:600;font-size:.95rem;border:1px solid var(--line);color:var(--ink);
+        background:var(--card)}
+  a.btn.pri{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+  h2{font-family:var(--serif);font-size:1.35rem;margin:2.6em 0 .5em}
+  p{margin:0 0 1em}
+  figure{margin:1.6em 0;text-align:center}
+  figure img{width:100%;max-width:320px;height:auto}
+  table{width:100%;border-collapse:collapse;font-size:.94rem;margin:.8em 0 1.2em;
+        background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-size:.78rem;letter-spacing:.07em;text-transform:uppercase;color:var(--mut);
+     font-weight:600;background:#fbfaf7}
+  tr:last-child td{border-bottom:0}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px 16px;
+      overflow-x:auto;font:13.5px/1.6 var(--mono);margin:.8em 0 1.2em}
+  code{font-family:var(--mono);font-size:.92em}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:1em 0 1.6em}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:15px 17px}
+  .card b{display:block;margin-bottom:4px;font-size:.97rem}
+  .card span{font-size:.9rem;color:var(--mut);line-height:1.55}
+  .note{font-size:.92rem;color:var(--mut);border-left:3px solid var(--line);padding-left:14px}
+  .wip{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.1em;
+       text-transform:uppercase;padding:4px 9px;border-radius:999px;
+       background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent);
+       margin-bottom:14px}
+  footer{margin-top:3em;padding-top:1.4em;border-top:1px solid var(--line);font-size:.9rem;
+         color:var(--mut)}
+  footer a{color:var(--accent)}
+</style>
+</head>
+<body>
+<main class="wrap">
+
+  <h1>backup</h1>
+  <p class="lede">Snapshot a repository before it changes — so a merge can never lose the code that was there. A reusable GitHub workflow plus a zero-dependency script: compressed, timestamped, rotated, and never full.</p>
+
+  <div class="claim">    <div class="big"><b>100</b><span>backups kept per repository, the oldest rotated out as new ones arrive</span></div>
+    <div class="big"><b>0</b><span>dependencies — the script runs on the standard library alone</span></div>
+</div>
+
+  <div class="cta">    <a class="btn pri" href="https://github.com/drsamonline/backup">Source</a>
+    <a class="btn" href="https://github.com/drsamonline/backup#readme">README</a>
+</div>
+
+  <figure>
+    <img src="assets/concept.svg" alt="A clock beside a stack of dated archives">
+  </figure>
+
+
+  <h2>What it does</h2>
+  <p>Before a merge replaces a repository's code, <code>backup</code> takes the state that is
+    about to be replaced and stores it, compressed, in a dumps repository:</p>
+  <pre>dumps/
+  drsamonline__ml-kit/
+    2026-10-24T103000Z/ml-kit.tar.gz
+    2026-10-24T110000Z/ml-kit.tar.gz
+  drsamonline__case-kit/
+    2026-10-24T103000Z/case-kit.tar.gz</pre>
+  <p>One folder per repository, one folder per backup named with the date and time, and inside
+    it the repository as a <code>.tar.gz</code>.</p>
+
+  <h2>The two rules that keep it safe</h2>
+  <div class="cards">
+    <div class="card"><b>It never fills up</b><span>Each repository keeps the newest 100
+      backups, configurable. Past that the oldest is deleted to make room — the most recent
+      work is always present and the store stays bounded.</span></div>
+    <div class="card"><b>It never stops</b><span>When a dumps repository passes its size cap
+      (800 MB by default), it rolls to a fresh one instead of failing the job it was
+      protecting.</span></div>
+  </div>
+  <p class="note">A backup step that can fail a deploy is a backup step that gets removed. The
+    rotation exists so that never happens.</p>
+
+
+  <footer>
+    <p>PolyForm Noncommercial 1.0.0. Part of the <a href="https://drsamonline.github.io/">Forge</a> estate.</p>
+  <!-- support:block:start -->
+<style>
+  /* Scoped to .support. Uses the host page's variables when they exist. */
+  .support{--s-ink:var(--ink,#14110e);--s-paper:var(--paper,#f7f2e9);--s-card:var(--paper-2,#fffdf8);
+           --s-muted:var(--muted,#6b6157);--s-line:var(--line,#e2d8c8);--s-accent:var(--accent,#2f6f8f);
+           font-family:var(--sans,ui-sans-serif,-apple-system,"Segoe UI",sans-serif);
+           color:var(--s-ink);padding:2.6rem 0 1rem;border-top:1px solid var(--s-line)}
+  .support-head{display:flex;gap:1rem;align-items:flex-start;margin:0 0 1.4rem}
+  .support-portrait{width:72px;height:72px;flex:0 0 72px;border-radius:50%;object-fit:cover;
+                    border:1px solid var(--s-line);background:var(--s-card)}
+  .support h2{font-size:1.15rem;letter-spacing:.08em;text-transform:uppercase;margin:0 0 .5rem;color:var(--s-muted)}
+  .support .support-lede{margin:0;max-width:44rem;color:var(--s-muted);font-size:.95rem}
+  .support-grid{display:grid;gap:.9rem;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));align-items:stretch}
+  .support-card{background:var(--s-card);border:1px solid var(--s-line);border-radius:.7rem;padding:.9rem 1rem;
+                display:flex;flex-direction:column;gap:.35rem}
+  .support-card h3{margin:0;font-size:.78rem;letter-spacing:.09em;text-transform:uppercase;color:var(--s-muted);font-weight:600}
+  .support-card p{margin:0;font-size:.92rem;line-height:1.5}
+  .support-card a{color:var(--s-accent);text-decoration:none;border-bottom:1px solid transparent;word-break:break-word}
+  .support-card a:hover,.support-card a:focus-visible{border-bottom-color:currentColor}
+  .support-id{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+  .support-id code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.95rem;
+                   background:transparent;border:1px dashed var(--s-line);border-radius:.35rem;padding:.15rem .45rem}
+  .support-copy{font:inherit;font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;
+                background:transparent;color:var(--s-muted);border:1px solid var(--s-line);
+                border-radius:.35rem;padding:.2rem .5rem;cursor:pointer}
+  .support-copy:hover,.support-copy:focus-visible{color:var(--s-ink);border-color:var(--s-ink)}
+  .support-card.upi{grid-row:span 1}
+  .support-qr{display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;margin-top:.2rem}
+  /* the white tile is load-bearing: a dark-mode QR does not scan */
+  .support-qr img{width:132px;height:132px;display:block;background:#fff;padding:.35rem;
+                  border:1px solid var(--s-line);border-radius:.4rem;image-rendering:pixelated}
+  .support-qr small{display:block;color:var(--s-muted);font-size:.8rem;max-width:11rem;line-height:1.4}
+  .support-foot{margin:1.2rem 0 0;font-size:.8rem;color:var(--s-muted)}
+  @media (prefers-reduced-motion:no-preference){.support-card{transition:border-color .15s ease}}
+  .support-card:target,.support-card:focus-within{border-color:var(--s-accent)}
+</style>
+
+<section class="support" id="support" aria-labelledby="support-h" data-support>
+  <div class="support-head">
+    <img class="support-portrait" src="assets/support-portrait.jpg" width="72" height="72"
+         alt="Dr. Sohil Momin" loading="lazy" decoding="async">
+    <div>
+      <h2 id="support-h">Support this work</h2>
+      <p class="support-lede">Everything here is free, offline and accountless. If it earned its keep,
+        there are a few ways to say so — pick whichever is easiest where you are.</p>
+    </div>
+  </div>
+  <div class="support-grid">
+
+    <div class="support-card upi">
+      <h3>UPI · India</h3>
+      <div class="support-id">
+        <code id="upi-vpa">drsohilboi@ybl</code>
+        <button class="support-copy" type="button" data-copy="drsohilboi@ybl"
+                aria-label="Copy the UPI ID drsohilboi@ybl">Copy</button>
+      </div>
+      <p><a href="upi://pay?pa=drsohilboi%40ybl&amp;pn=Dr.%20Sohil%20Momin&amp;cu=INR">Open in a UPI app →</a></p>
+      <div class="support-qr">
+        <img src="assets/upi-qr.svg" width="132" height="132"
+             alt="QR code for the UPI ID drsohilboi@ybl, payee Dr. Sohil Momin">
+        <small>Scan with any UPI app. Payee: Dr. Sohil Momin.</small>
+      </div>
+    </div>
+
+    <div class="support-card">
+      <h3>Ko-fi</h3>
+      <p>One-off tip, no account needed.<br>
+        <a href="https://ko-fi.com/matneo" target="_blank" rel="noopener noreferrer">ko-fi.com/matneo →</a></p>
+    </div>
+
+    <div class="support-card">
+      <h3>PayPal</h3>
+      <p>For outside India, or a card instead of UPI.<br>
+        <a href="https://paypal.me/drsohilmomin?locale.x=en_GB&amp;country.x=IN"
+           target="_blank" rel="noopener noreferrer">paypal.me/drsohilmomin →</a></p>
+    </div>
+
+    <div class="support-card">
+      <h3>My books</h3>
+      <p>The Amazon author store — every title, one shelf.<br>
+        <a href="https://www.amazon.com/stores/author/B08ZT331LY/allbooks?ccs_id=aed72b9f-71d9-41dc-adee-e9368a317acc"
+           target="_blank" rel="noopener noreferrer">Amazon bookstore →</a></p>
+    </div>
+
+    <div class="support-card">
+      <h3>More apps</h3>
+      <p>The rest of the estate, all of it offline-first.<br>
+        <a href="https://drsamonline.github.io/" target="_blank" rel="noopener noreferrer">drsamonline.github.io →</a></p>
+    </div>
+
+    <div class="support-card">
+      <h3>Say hello</h3>
+      <p>Bugs, corrections, requests.<br>
+        <a href="mailto:sohilmomin2000@gmail.com">sohilmomin2000@gmail.com →</a></p>
+    </div>
+
+  </div>
+  <p class="support-foot">No accounts, no tracking, nothing on this page loads from the network.
+    A thank-you is a thank-you; nothing is gated behind it.</p>
+</section>
+
+<script>
+  /* Copy buttons degrade to "select the text yourself" — never a dead button. */
+  (function () {
+    document.querySelectorAll('.support [data-copy]').forEach(function (btn) {
+      if (btn.dataset.copyWired) return;
+      btn.dataset.copyWired = '1';
+      btn.addEventListener('click', function () {
+        var value = btn.getAttribute('data-copy');
+        var label = btn.textContent;
+        function done() {
+          btn.textContent = 'Copied';
+          setTimeout(function () { btn.textContent = label; }, 1500);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(value).then(done, function () {});
+          return;
+        }
+        var t = document.createElement('textarea');
+        t.value = value; t.setAttribute('readonly', ''); t.style.position = 'absolute';
+        t.style.left = '-9999px'; document.body.appendChild(t); t.select();
+        try { document.execCommand('copy'); done(); } catch (e) {}
+        t.remove();
+      });
+    });
+  })();
+</script>
+<!-- support:block:end -->
+</footer>
+</main>
+<!-- support:landing -->
+</body>
+</html>
