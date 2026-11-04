@@ -839,7 +839,12 @@ def read_state_all(owner, base, token):
     merged = {}
     for name in dump_store_names(owner, base, token):
         for key, entry in (read_state(owner, name, token).get("repos") or {}).items():
-            if key not in merged or (entry.get("at") or "") > (merged[key].get("at") or ""):
+            # Compare NORMALISED timestamps. The seed wrote "20261101T215700" while the
+            # backup writes "2026-11-01T215700Z", and comparing those as strings makes the
+            # older one win every time: '-' sorts below '1', so the seeded entry always beat
+            # the fresh one and the state never advanced. Repositories were then re-backed-up
+            # every run - the skip rate fell from 81 to 14 over two days.
+            if key not in merged or _norm_ts(entry.get("at")) > _norm_ts(merged[key].get("at")):
                 merged[key] = entry
     return merged
 
@@ -888,7 +893,11 @@ def seed_state(owner, base, token, log=print):
         pushed = _norm_ts(meta.get("pushed_at"))
         stored = newest.get(key, "")
         if stored and pushed and pushed <= stored:
-            known[key] = {"sha": want[1], "tag": want[2], "at": stored, "seeded": True}
+            known[key] = {"sha": want[1], "tag": want[2],
+                          # canonical stamp, not the normalised form used for comparing
+                          "at": stamp(datetime.strptime(stored, "%Y%m%dT%H%M%S")
+                                      .replace(tzinfo=timezone.utc)),
+                          "seeded": True}
             seeded += 1
         else:
             pending.append(name)
