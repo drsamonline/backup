@@ -58,11 +58,39 @@
   footer{margin-top:3em;padding-top:1.4em;border-top:1px solid var(--line);font-size:.9rem;
          color:var(--mut)}
   footer a{color:var(--accent)}
-</style>
+
+
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --paper:#14161a; --card:#1b1e24; --ink:#eceef2; --mut:#a3aab8;
+    --line:#2a2f38; --accent:#5aa17c; --accent-ink:#0b0d10; --code:#1d2027;
+  }
+
+  /* ICON ONLY, inside the header. A text chip needs ~70px and these rows are full. */
+  .theme-btn{
+    display:inline-flex;align-items:center;justify-content:center;flex:none;
+    width:30px;height:30px;margin-left:10px;padding:0;background:transparent;color:inherit;
+    border:1px solid var(--line);border-radius:50%;cursor:pointer;opacity:.8;
+  }
+  .theme-btn:hover{opacity:1}
+  .theme-btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round}
+  .theme-btn-top{float:right;margin:2px 0 0 10px}</style>
+<script>
+/* THEME BEFORE FIRST PAINT: a page that paints one theme and flips to the other is a
+   flash, and a stored choice applied after load is a bug the reader can see. */
+(function () {
+  try {
+    var s = localStorage.getItem("theme");
+    var d = s ? s === "dark" : matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute("data-theme", d ? "dark" : "light");
+  } catch (e) { document.documentElement.setAttribute("data-theme", "light"); }
+})();
+</script>
 </head>
 <body>
 <main class="wrap">
 
+  <button class="theme-btn ghost theme-btn-top" id="themeBtn" type="button" aria-label="Switch theme" title="Switch theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
   <h1>backup</h1>
   <p class="lede">Snapshot a repository before it changes — so a merge can never lose the code that was there. A reusable GitHub workflow plus a zero-dependency script: compressed, timestamped, rotated, and never full.</p>
 
@@ -250,5 +278,24 @@
 </footer>
 </main>
 <!-- support:landing -->
+<script>
+(function () {
+  var b = document.getElementById("themeBtn");
+  if (!b) return;
+  function sync() {
+    var dark = document.documentElement.getAttribute("data-theme") === "dark";
+    b.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+    b.title = b.getAttribute("aria-label");
+    b.setAttribute("aria-pressed", String(dark));
+  }
+  b.addEventListener("click", function () {
+    var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("theme", next); } catch (e) {}
+    sync();
+  });
+  sync();
+})();
+</script>
 </body>
 </html>
