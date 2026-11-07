@@ -13,21 +13,52 @@ def ok(name, cond):
     if cond: pass_ += 1; print("PASS  " + name)
     else: fail += 1; print("FAIL  " + name)
 
-# ---- rotation: keep the newest N, delete the oldest ----
-names = [f"2026-10-{d:02d}T000000Z" for d in range(1, 11)]
-ok("under the limit -> delete nothing", B.dumps_to_delete(names[:5], 100) == [])
-ok("at the limit -> delete nothing", B.dumps_to_delete(names[:100], 100) == [])
+# ---- retention: grandfather, father, son ----
+#
+# These replaced a block that asserted the OLD counting rule ("keep the newest N") and had
+# been failing since the rule changed: retention is by AGE now, because counting to 100
+# drops the 100th oldest whether it was a quiet Tuesday or the day before a release. A suite
+# that describes a rule the code no longer implements tells you nothing, and a red suite is
+# read by nobody - which is the worst state for the one function here that DELETES things.
 import datetime as _dt
-_base = _dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc)
-_many = [B.stamp(_base + _dt.timedelta(hours=i)) for i in range(101)]
-ok("101 dumps, keep 100 -> exactly the OLDEST goes", B.dumps_to_delete(_many, 100) == [_many[0]])
-_more = _many + [B.stamp(_base + _dt.timedelta(hours=200 + i)) for i in range(49)]
-ok("150 dumps, keep 100 -> the 50 oldest go", len(B.dumps_to_delete(_more, 100)) == 50)
-ok("...and the survivors are the newest 100", all(n not in B.dumps_to_delete(_more, 100) for n in _more[-100:]))
-ok("the order it is given does not matter", B.dumps_to_delete(list(reversed(names)), 3) == names[:7])
-ok("keep 3 -> the newest 3 survive", [n for n in names if n not in B.dumps_to_delete(names, 3)] == names[-3:])
-ok("keep 0 -> rotation off", B.dumps_to_delete(names, 0) == [])
-ok("keep -1 -> rotation off", B.dumps_to_delete(names, -1) == [])
+_now = _dt.datetime(2026, 11, 7, 12, 0, tzinfo=_dt.timezone.utc)
+
+def _ago(days=0, hours=0):
+    return B.stamp(_now - _dt.timedelta(days=days, hours=hours))
+
+# inside the 7-day window everything is kept, however many there are
+_recent = [_ago(hours=h) for h in range(0, 24)]
+ok("everything inside the day window is kept",
+   B.dumps_to_delete(_recent, now=_now) == [])
+
+# older than 7 days: one survivor per ISO week, the newest of that week
+_wk = [_ago(days=10), _ago(days=11), _ago(days=12)]          # one week
+_wk2 = [_ago(days=17), _ago(days=18)]                        # the week before
+_names = _wk + _wk2
+_doomed = B.dumps_to_delete(_names, now=_now)
+ok("older than the day window, one per week survives", len(_doomed) == 3)
+ok("...and the survivors are each week's newest",
+   sorted(_names[-len(_names) + len(_doomed):]) == sorted(_doomed) or
+   set(_names) - set(_doomed) == {_wk[0], _wk2[0]})
+
+# the newest snapshot is never deleted, even when everything else goes
+ok("the newest is never deleted",
+   _ago(days=0) not in B.dumps_to_delete([_ago(days=400), _ago(days=500), _ago(days=0)], now=_now))
+
+# a year-old snapshot is dropped once 12 months have something newer
+_old = [_ago(days=30 * m) for m in range(1, 15)]
+ok("beyond the month window, the oldest months go",
+   len(B.dumps_to_delete(_old, now=_now)) > 0)
+
+# keep>0 is a hard cap on the TOTAL, not a floor
+ok("keep caps the total", len([n for n in _recent if n not in
+   B.dumps_to_delete(_recent, keep=5, now=_now)]) == 5)
+ok("keep 0 means no cap", B.dumps_to_delete(_recent, keep=0, now=_now) == [])
+
+# the order the names arrive in must not change the answer
+ok("the order it is given does not matter",
+   B.dumps_to_delete(list(reversed(_names)), now=_now) == _doomed)
+
 
 # ---- the folder name is a date and a time, sortable ----
 import datetime
@@ -86,7 +117,9 @@ def _run_all(failing):
     orig = (B.all_repos, B.dump_one, B.pick_dumps_repo, B.write_manifest, sys.argv)
     B.all_repos = lambda owner, token: ["a", "b", "c"]
     B.pick_dumps_repo = lambda *a, **k: "dumps"
-    B.dump_one = lambda so, sr, do, du, tok, keep, ref="", log=print: sr not in failing
+    # the stub has to accept what dump_one accepts, or a keyword added to the real
+    # signature (seven_zip, here) breaks the harness instead of the code under test
+    B.dump_one = lambda so, sr, do, du, tok, keep, ref="", log=print, seven_zip=True: sr not in failing
     # The manifest is written after the loop and its result is the run's result (F-98),
     # so the loop tests stub it; the manifest's own behaviour is tested separately below.
     B.write_manifest = lambda *a, **k: 0
