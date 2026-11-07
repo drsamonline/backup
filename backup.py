@@ -718,7 +718,15 @@ def delete_folder(owner, dumps, path, token, log=None):
 # --------------------------------------------------------------------------- #
 # --all: dump every repository, from ONE workflow in ONE repository
 # --------------------------------------------------------------------------- #
-SKIP = {"dumps", "backup", "drsamonline", "drsamonline.github.io"}
+# The stores and the tool itself. NOT the profile repo and NOT the hub.
+#
+# `drsamonline` and `drsamonline.github.io` used to be in this set, described as "meta
+# repos" - as if a repository holding the profile README and the hub page were not worth
+# restoring. On 2026-11-07 the hub's Pages source was found pointing at a directory that
+# did not exist and the site had to be rebuilt by hand; it was the one repository in the
+# estate with a demonstrated recovery need and the one with no backup. Both are sources
+# like any other and are now dumped.
+SKIP = {"dumps", "backup"}
 
 
 def _is_dump_store(name):
