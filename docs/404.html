@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Not found — backup</title>
+<style>
+  :root { --bg:#f7f6f2; --ink:#14161a; --dim:#5c6470; --acc:#2f6b4f; --line:#e2ddd2; color-scheme: dark light; }
+  :root[data-theme="light"] { --bg:#f7f8fa; --ink:#12161c; --dim:#5b6674; --line:#dfe4ea; color-scheme: light; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px; text-align:center;
+         background:var(--bg); color:var(--ink); font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  h1 { font-size:clamp(2.6rem,9vw,4.5rem); margin:0 0 .35em; letter-spacing:-.02em; }
+  p { color:var(--dim); margin:0 0 .6em; }
+  a { color:var(--acc); text-decoration:none; border-bottom:1px solid var(--line); }
+  a:hover { border-bottom-color:var(--acc); }
+  .box { border:1px solid var(--line); border-radius:14px; padding:clamp(28px,6vw,52px); max-width:34rem; }
+</style>
+<script>
+/* A 404 is not a page anyone navigates to on purpose, but it must not flash the wrong
+   theme. It reads the same key this site writes, falls back to the reader's system
+   preference, and carries NO control - the site's own toggle owns that choice. */
+(function () {
+  try {
+    var s = localStorage.getItem("theme");
+    var dark = s ? s === "dark" : !matchMedia("(prefers-color-scheme: light)").matches;
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  } catch (e) {
+    document.documentElement.setAttribute("data-theme", "dark");
+  }
+})();
+</script>
+</head>
+<body>
+  <div class="box">
+    <h1>404</h1>
+    <p>That page is not here.</p>
+    <p><a href="./">Back to backup</a></p>
+  </div>
+</body>
+</html>
