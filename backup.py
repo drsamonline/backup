@@ -743,11 +743,22 @@ def all_repos(owner, token):
 
     Falls back to the public list when the token cannot see private repos.
     """
-    out, page = [], 1
+    out, page, public = [], 1, False
     while True:
-        batch = call("GET", f"/user/repos?per_page=100&page={page}&affiliation=owner", token)
+        path = (f"/users/{owner}/repos?per_page=100&page={page}&sort=pushed" if public
+                else f"/user/repos?per_page=100&page={page}&affiliation=owner")
+        batch = call("GET", path, token)
         if isinstance(batch, dict) and batch.get("_error"):
-            batch = call("GET", f"/users/{owner}/repos?per_page=100&page={page}&sort=pushed", token)
+            # The private list failing is expected on a token that cannot see it,
+            # and the public list is the documented fallback - but only from page
+            # one. Falling back mid-pagination mixed page 1 of the private list
+            # with page 2 of the public one, and a repository missing from the
+            # mixed set is a repository that quietly stops being backed up.
+            if not public and page == 1:
+                public = True
+                continue
+            raise SystemExit(f"could not list repositories for {owner} (page {page}): "
+                             f"{batch.get('_error')}")
         if not isinstance(batch, list) or not batch:
             break
         out += batch
